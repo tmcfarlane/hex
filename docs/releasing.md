@@ -38,13 +38,19 @@ Release (push to dev: dev channel; workflow_dispatch: ref + channel check | dev 
 ├─ sign-windows             Azure Artifact Signing of both hex.exe, Authenticode check                [release]
 ├─ installers               windows-installers.yml: Setup.exe around them, tested on x64 + ARM64      [build]
 ├─ sign-windows-installers  Azure Artifact Signing of both Setup.exe                                  [release]
+├─ check-linux, -macos,     stable, check: the full suites on the candidate (check-<os>.yml, called   [build]
+│  -windows                 here; pull requests only compile, dev pushes run no checks)
+├─ onboarding               stable, check: scripts/check-onboarding.sh (scene goldens + a first run   [build]
+│                           in a clean data folder, Linux). Stable publishes only once these four pass
 ├─ publish                  OIDC: every signed target, then the release (release-service.sh); Nix     [release]
 ├─ github                   last: tag v<version> on the released commit (tag-release.sh), then the    [contents: write]
 │                           GitHub release mirror (publish-github-release.sh); GITHUB_TOKEN only.
 │                           check: pushes and deletes a throwaway v0.0.0-test-<run> tag
 ├─ aur-stage → aur          stable: makepkg + install from the published files → push-aur.sh          [build → release]
 ├─ homebrew-stage → homebrew stable: render + brew style/audit → push-homebrew.sh                     [build → release]
-└─ record-aur, record-brew  OIDC: the package manager serves the version                              [release]
+├─ record-aur, record-brew  OIDC: the package manager serves the version                              [release]
+└─ dev-notes-stage → dev-notes  dev: PR titles since the last dev build (release-dev-notes.sh) →     [build → release]
+                            dev-notes.json in hex-production-files (publish-dev-notes.sh)
 ```
 
 Without a platform's signing values, dev and check runs go on without that
@@ -133,7 +139,13 @@ secrets; the `homebrew` job pushes that verified file with the tap deploy key
   links. Every push to `dev` runs it, except pushes that change only `docs/`,
   `site/`, or Markdown; a running dev release always finishes, and only the newest push that lands meanwhile waits to run next (GitHub drops the ones between), and
   `gh workflow run release.yml --ref dev -f channel=dev -f ref=dev`
-  runs it by hand. It runs in `release`, which needs no approval. The
+  runs it by hand. It runs in `release`, which needs no approval. Each dev
+  build's notes are the titles of the PRs merged since the previous dev
+  build, without CI fixes and changes outside the app
+  (`scripts/release-dev-notes.sh`); once the build is published they join
+  `https://anoma.ly/hex/files/dev-notes.json`, which the changelog at
+  `https://anoma.ly/hex/dev` (the dev release's `notes_url`) and the app's
+  Restart to update read. The
   version is `0.0.0-dev-<run number>`, as OpenCode numbers its dev builds.
   Versions are display text that nothing compares: each channel has one
   current release and installs follow it, so a dev build below 2.3.1 is fine,
@@ -179,7 +191,9 @@ fast-forward from `dev`; nobody commits to it directly, and its ruleset
 refuses force pushes and deletion.
 
 1. Bump `version` in `Cargo.toml` (and `Cargo.lock`), add
-   `docs/releases/<version>.md`, push to `dev`.
+   `docs/releases/<version>.md`, push to `dev`. Run
+   `scripts/check-onboarding.sh` on that commit and give Dax its result and
+   scene images with the go/no-go; stable releases need his explicit go-ahead.
 2. Let the push to `dev` publish its dev-channel build
    (`https://anoma.ly/release/hex/desktop/dev.json`) and try it on an install
    set to the Dev update channel.
@@ -222,6 +236,7 @@ cloudflare.config.ts (cf deploy --prebuilt --mode <mode>, from CI only)
 
 https://anoma.ly/hex/                      the site; downloads read the service's stable manifest at build time
 ├─ download/dev                            302 to the dev channel's macos-arm64-dmg, read per request
+├─ dev                                     the dev builds' changelog, rendered per request from files/dev-notes.json
 ├─ install-linux.sh, install-windows.ps1   the installers, copied from .github/release/ at build time
 └─ files/                                  the frozen 2.3.1 bucket for old clients (below)
 ```
@@ -295,14 +310,16 @@ Two account tokens, each used by one locked step only:
   take effect on the routes API in testing.
 - `hex-r2-production-files` (`release` secret `R2_SECRET_ACCESS_KEY`, variable
   `R2_ACCESS_KEY_ID` = its id): object write on `hex-production-files` only,
-  used only by the Legacy appcast workflow (`.github/release/r2-put.sh`).
+  used through `.github/release/r2-put.sh` by the Installers and Legacy
+  appcast workflows and Release's dev-notes job.
 
 ## Old clients (2.3.1 and earlier)
 
 `https://anoma.ly/hex/files/` (`hex-production-files`) keeps serving the 2.3.1
 `linux-update.json`, `windows-update.json`, `windows-aarch64-update.json`,
-`appcast.xml`, and their files, frozen: nothing publishes there anymore, and
-those installs see no update on their own. The new Hex is effectively a new
+`appcast.xml`, and their files, frozen: nothing updates them anymore (the
+bucket now also holds the installers and `dev-notes.json`), and those
+installs see no update on their own. The new Hex is effectively a new
 app (new updater, and on macOS a new bundle ID), so:
 
 - **macOS:** at the first release on the service, add one informational item
@@ -365,7 +382,7 @@ it. No reviewer is required.
 | --- | --- |
 | (none) | publishing to the release service: the job's GitHub OIDC token |
 | `CLOUDFLARE_API_TOKEN`, var `CLOUDFLARE_ACCOUNT_ID` | site deploys (`hex-site-deploy`, used only by `deploy-site.sh`) |
-| `R2_SECRET_ACCESS_KEY`, var `R2_ACCESS_KEY_ID` | the one-time legacy appcast upload (`hex-r2-production-files`) |
+| `R2_SECRET_ACCESS_KEY`, var `R2_ACCESS_KEY_ID` | uploads to `hex-production-files` (`hex-r2-production-files`): the installers, the legacy appcast, and `dev-notes.json` |
 | `AUR_SSH_PRIVATE_KEY` | pushes `hex-bin` (key `github-actions-hex-aur`) |
 | `HOMEBREW_TAP_DEPLOY_KEY` | pushes `Casks/hex.rb` (deploy key `github-actions-hex-homebrew`, write access on `anomalyco/homebrew-tap` only) |
 | `AZURE_*` | Authenticode (docs/windows-signing.md) |

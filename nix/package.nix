@@ -12,6 +12,8 @@
   alsa-lib,
   alsa-plugins,
   pipewire,
+  libva,
+  ffmpeg-headless,
   openssl,
   libxkbcommon,
   wayland,
@@ -47,6 +49,10 @@ let
       wayland
       libxkbcommon
       fontconfig
+      # Linux Annotate dlopens libpipewire-0.3, libva and libva-drm. libva finds VA-API
+      # drivers through its built-in /run/opengl-driver path or LIBVA_DRIVERS_PATH.
+      pipewire
+      libva
     ];
     ALSA_PLUGIN_DIR = symlinkJoin {
       name = "hex-alsa-plugins";
@@ -60,6 +66,8 @@ let
     curl
     wl-clipboard
     wtype
+    # Annotate runs ffmpeg and ffprobe; the headless build includes libx264.
+    ffmpeg-headless
   ];
 in
 rustPlatform.buildRustPackage (finalAttrs: {
@@ -88,7 +96,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
     lockFile = ../Cargo.lock;
     outputHashes = {
       "transcribe-rs-0.3.11" = "sha256-MJJiug3LfbKsuHcL2+LJk95+j5kk/MWzb5ihdBlHLmE=";
-      "rune-0.0.1" = "sha256-XEljDZevuap9UW96MCA/kdMtBBsjPmXYi5rai1DOVFQ=";
+      "rune-0.0.1" = "sha256-zYMGfhtkhGLrTj139TfRhDyt9ZEsQ0lr9cAlu/gGgcI=";
       "transcribe-cpp-sys-0.4.1" = "sha256-AP8+t4baAzjOVJo76vodPoWv8lrFLR2tsXvsrbMFeSk=";
     };
   };

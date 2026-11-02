@@ -7,9 +7,17 @@ plan. The proposed handoff uses the old Swift app's existing Sparkle window to
 offer a download link; downloading and installing remains an explicit user action.
 
 - Do not import Swift settings, history, audio, models, or other data.
-- Do not automatically install, quit, delete, or replace the old app.
+- Do not automatically install, delete, or replace the old app. The one
+  exception (Kit, 2026-11-01): once setup is ready and the listener starts,
+  `anomaly.hex` asks a running old Hex (the retired bundle IDs below) to quit,
+  so the two never answer the same shortcut. It stays installed.
 - Do not adopt the Swift bundle identifier or publish a Rust payload to its feed.
 - Do not move or copy existing Rust settings, models, or history.
+- Narrow TCC exception: when `anomaly.hex` shows an untrusted Accessibility,
+  Screen Recording, or System Audio Recording permission row (or the user clicks
+  `"Still grey? Fix it"`), it may run `tccutil reset` against retired Hex bundle
+  identifiers (`com.kitlangton.hex2`, `com.kitlangton.Hex`, `com.kitlangton.Hex.debug`)
+  so System Settings does not list duplicate **Hex** rows that shadow the new grant.
 - New Rust users complete ordinary setup and download their selected local model.
 
 ## Separate Identities

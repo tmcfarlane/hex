@@ -1,10 +1,12 @@
 // One Worker serves Hex under /hex on its host: the site, the release files
 // bucket at /hex/files (feeds, appcast, installers, artifacts), and
-// /hex/download/dev, the latest dev channel Mac download, and
+// /hex/download/dev, the latest dev channel Mac download, /hex/dev, the dev
+// builds' changelog, and
 // /hex/download/<target>, the release every download button names. Other hosts and
 // plain HTTP redirect to the canonical host. `cf dev` with ANY_HOST set turns
 // the redirect off for local testing.
-import { BASE_PATH, DEV_DOWNLOAD_PATH, DOWNLOAD_PATH, FILES_PATH, RELEASE_SERVICE, stripBase, withBase } from "./src/base"
+import { BASE_PATH, DEV_DOWNLOAD_PATH, DEV_NOTES_PATH, DOWNLOAD_PATH, FILES_PATH, RELEASE_SERVICE, stripBase, withBase } from "./src/base"
+import { parseDevNotes, renderDevNotes } from "./src/dev-notes"
 
 type Env = {
   ASSETS: { fetch(request: Request): Promise<Response> }
@@ -28,13 +30,16 @@ export default {
     }
     if (url.pathname.startsWith(`${FILES_PATH}/`)) return file(request, env, decodeURIComponent(url.pathname.slice(FILES_PATH.length + 1)))
     if (url.pathname === DEV_DOWNLOAD_PATH) return devDownload(request)
+    if (url.pathname === DEV_NOTES_PATH || url.pathname === `${DEV_NOTES_PATH}/`) return devNotes(request, env)
     if (url.pathname.startsWith(`${DOWNLOAD_PATH}/`)) return download(request, url.pathname.slice(DOWNLOAD_PATH.length + 1))
 
     // The route also matches paths like /hexagon, which are not ours.
     const path = stripBase(url.pathname)
     if (path === undefined) return new Response("Not found", { status: 404 })
     const assetUrl = new URL(url)
-    assetUrl.pathname = path
+    // Docs are Markdown files served at clean paths, for agents to fetch.
+    const doc = DOCS.get(path)
+    assetUrl.pathname = doc ?? path
     const assetRequest = new Request(assetUrl, request)
     const response = await env.ASSETS.fetch(assetRequest)
     const headers = new Headers(response.headers)
@@ -44,6 +49,7 @@ export default {
     if (path.startsWith("/assets/")) {
       headers.set("Cache-Control", "public, max-age=31536000, immutable")
     }
+    if (doc) headers.set("Content-Type", "text/markdown; charset=utf-8")
     secure(headers)
     if (path.endsWith(".mp4")) return ranged(request, request.method === "HEAD" ? await env.ASSETS.fetch(new Request(assetUrl, { headers: request.headers })) : response, headers)
     return new Response(response.body, {
@@ -53,6 +59,11 @@ export default {
     })
   },
 }
+
+const DOCS = new Map([
+  ["/docs/transforms", "/docs/transforms.md"],
+  ["/docs/admin", "/docs/admin.md"],
+])
 
 function secure(headers: Headers) {
   headers.set("Strict-Transport-Security", "max-age=31536000")
@@ -150,6 +161,37 @@ async function devDownload(request: Request): Promise<Response> {
   const headers = new Headers({ Location: location.toString(), "Cache-Control": "no-store" })
   secure(headers)
   return new Response(null, { status: 302, headers })
+}
+
+// The dev builds' changelog, rendered from the files bucket's dev-notes.json.
+// The Release workflow writes it to the production bucket only, so the dev
+// site reads the production copy.
+const DEV_NOTES_KEY = "dev-notes.json"
+const PRODUCTION_DEV_NOTES = "https://anoma.ly/hex/files/dev-notes.json"
+
+async function devNotes(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, HEAD" } })
+  }
+  let value: unknown = undefined
+  try {
+    const object = await env.FILES.get(DEV_NOTES_KEY)
+    if (object) value = await object.json()
+    else if (env.CANONICAL_HOST !== "anoma.ly") {
+      const response = await fetch(PRODUCTION_DEV_NOTES, { headers: { "User-Agent": "hex-site" } })
+      if (response.ok) value = await response.json()
+    }
+  } catch {
+    value = undefined
+  }
+  const headers = new Headers({
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "public, max-age=60",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'",
+  })
+  secure(headers)
+  const body = request.method === "HEAD" ? null : renderDevNotes(parseDevNotes(value), DEV_DOWNLOAD_PATH, new URL(request.url).searchParams.get("since"))
+  return new Response(body, { headers })
 }
 
 // Serves one bucket object with its stored Content-Type, Cache-Control, and

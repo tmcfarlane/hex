@@ -7,7 +7,8 @@
 //! model switching, mouse shortcuts, pausing the browser, restoring Paste
 //! last dictation's default shortcut, keeping the dictation on the
 //! clipboard or only copying it (macOS), a second dictation shortcut
-//! (macOS), Toggle's tap or hold (macOS), and Terminal paste
+//! (macOS), Toggle's tap or hold (macOS), stopping an automatic meeting
+//! recording when its call ends (macOS), and Terminal paste
 //! and shortcut sharing on Windows) is just its toggle.
 //!
 //! Each feature has an audience (`Feature::audience`): `Everyone` ships in
@@ -18,7 +19,7 @@
 //! Gate a feature where its work starts (the worker, thread, or capture
 //! that does it), not only where its UI shows.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::Subcommand;
 use color_eyre::Result;
@@ -83,11 +84,18 @@ pub enum Feature {
     SidedChords,
     TapOrHold,
     BenchmarkDetails,
+    ParakeetUltra,
+    StandaloneSpecialKeys,
+    HistoryStats,
+    RecentDictations,
+    SkipPauses,
+    StopWhenCallEnds,
+    OutputFixes,
     WordsToCaret,
 }
 
 impl Feature {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 33] = [
         Self::Meetings,
         Self::VoiceFilter,
         Self::Playground,
@@ -113,6 +121,13 @@ impl Feature {
         Self::SidedChords,
         Self::TapOrHold,
         Self::BenchmarkDetails,
+        Self::ParakeetUltra,
+        Self::StandaloneSpecialKeys,
+        Self::HistoryStats,
+        Self::RecentDictations,
+        Self::SkipPauses,
+        Self::StopWhenCallEnds,
+        Self::OutputFixes,
         Self::WordsToCaret,
     ];
 
@@ -161,9 +176,27 @@ impl Feature {
             | Self::PickerSortFilter
             | Self::SidedChords
             | Self::TapOrHold
-            | Self::BenchmarkDetails => Audience::Everyone,
-            Self::WordsToCaret => Audience::Dev,
+            | Self::BenchmarkDetails
+            | Self::ParakeetUltra
+            | Self::StandaloneSpecialKeys
+            | Self::HistoryStats
+            | Self::RecentDictations
+            | Self::SkipPauses
+            | Self::StopWhenCallEnds
+            | Self::OutputFixes
+            | Self::WordsToCaret => Audience::Everyone,
         }
+    }
+
+    /// Why turning this feature off is refused now: Parakeet Ultra stays on
+    /// while it is the dictation model, until a switch to another succeeds.
+    pub fn off_refusal(self, settings: &AppSettings) -> Option<&'static str> {
+        (self == Self::ParakeetUltra
+            && settings.transcription.model
+                == crate::transcription::models::TranscriptionModelId::ParakeetUltra)
+            .then_some(
+                "Parakeet Ultra is the dictation model; choose another model before turning it off",
+            )
     }
 
     /// The feature `hex settings` key `key` switches (its toggle, or
@@ -179,11 +212,14 @@ impl Feature {
 
     fn on_this_os(self) -> bool {
         match self {
-            Self::Meetings | Self::LiveChapters | Self::SubtitleExport => {
+            Self::Meetings | Self::LiveChapters | Self::SubtitleExport | Self::StopWhenCallEnds => {
                 cfg!(target_os = "macos")
             }
             Self::VoiceFilter => cfg!(any(target_os = "macos", target_os = "linux")),
             Self::TerminalPaste | Self::ShareShortcut => cfg!(target_os = "windows"),
+            Self::StandaloneSpecialKeys | Self::SkipPauses => {
+                cfg!(any(target_os = "linux", target_os = "windows"))
+            }
             Self::MouseShortcuts
             | Self::PauseBrowser
             | Self::KeepOnClipboard
@@ -192,6 +228,7 @@ impl Feature {
             | Self::SmartSpacing
             | Self::SidedChords
             | Self::TapOrHold
+            | Self::RecentDictations
             | Self::WordsToCaret => cfg!(target_os = "macos"),
             Self::KeyboardModelSwitching => crate::keyboard_input_sources::available(),
             Self::Playground
@@ -203,6 +240,9 @@ impl Feature {
             | Self::SpokenSymbols
             | Self::PickerSortFilter
             | Self::BenchmarkDetails
+            | Self::ParakeetUltra
+            | Self::HistoryStats
+            | Self::OutputFixes
             | Self::FillerWords => true,
         }
     }
@@ -235,6 +275,13 @@ impl Feature {
             Self::SidedChords => "sided-modifier-chords",
             Self::TapOrHold => "tap-or-hold",
             Self::BenchmarkDetails => "benchmark-details",
+            Self::ParakeetUltra => "parakeet-ultra",
+            Self::StandaloneSpecialKeys => "special-keys",
+            Self::HistoryStats => "history-stats",
+            Self::RecentDictations => "recent-dictations",
+            Self::SkipPauses => "skip-pauses",
+            Self::StopWhenCallEnds => "stop-when-call-ends",
+            Self::OutputFixes => "output-fixes",
             Self::WordsToCaret => "words-to-caret",
         }
     }
@@ -267,6 +314,13 @@ impl Feature {
             Self::SidedChords => "labs.sided_modifier_chords",
             Self::TapOrHold => "labs.tap_or_hold",
             Self::BenchmarkDetails => "labs.benchmark_details",
+            Self::ParakeetUltra => "labs.parakeet_ultra",
+            Self::StandaloneSpecialKeys => "labs.standalone_special_keys",
+            Self::HistoryStats => "labs.history_stats",
+            Self::RecentDictations => "labs.recent_dictations",
+            Self::SkipPauses => "labs.skip_pauses",
+            Self::StopWhenCallEnds => "labs.stop_when_call_ends",
+            Self::OutputFixes => "labs.output_fixes",
             Self::WordsToCaret => "labs.words_to_caret",
         }
     }
@@ -330,7 +384,31 @@ impl Feature {
             Self::BenchmarkDetails => {
                 "Show each model's raw error rate, benchmark, and source in the Local transcription picker"
             }
-            Self::WordsToCaret => "Pasted words fly from the HUD to the text cursor",
+            Self::ParakeetUltra => {
+                "Offer Parakeet Ultra, Moondream's post-trained Parakeet v3, in the Local transcription picker"
+            }
+            Self::StandaloneSpecialKeys if cfg!(target_os = "windows") => {
+                "Use Insert, Home, End, Page Up, or Page Down alone as a shortcut"
+            }
+            Self::StandaloneSpecialKeys => {
+                "Use Menu, Pause, or Scroll Lock alone as a shortcut, such as Caps Lock remapped to Menu"
+            }
+            Self::HistoryStats => {
+                "Show a summary of your retained dictations at the top of History, with hex history stats"
+            }
+            Self::RecentDictations => {
+                "Copy one of your last five dictations from the menu bar, under Paste Last Dictation"
+            }
+            Self::SkipPauses => {
+                "Shorten long pauses before a whole dictation goes to the model, so slow computers paste sooner"
+            }
+            Self::StopWhenCallEnds => {
+                "Stop a meeting recording Hex started on its own 30 s after the call app leaves the microphone and goes quiet"
+            }
+            Self::OutputFixes => {
+                "Offer Vocabulary and Fix this beside Output's Try result, to correct a wrong result"
+            }
+            Self::WordsToCaret => "The homepage character speaks your words toward the text cursor",
         }
     }
 
@@ -366,8 +444,61 @@ impl Feature {
             Self::SidedChords => settings.labs.sided_modifier_chords,
             Self::TapOrHold => settings.labs.tap_or_hold,
             Self::BenchmarkDetails => settings.labs.benchmark_details,
+            Self::ParakeetUltra => settings.labs.parakeet_ultra,
+            Self::StandaloneSpecialKeys => settings.labs.standalone_special_keys,
+            Self::HistoryStats => settings.labs.history_stats,
+            Self::RecentDictations => settings.labs.recent_dictations,
+            Self::SkipPauses => settings.labs.skip_pauses,
+            Self::StopWhenCallEnds => settings.labs.stop_when_call_ends,
+            Self::OutputFixes => settings.labs.output_fixes,
             Self::WordsToCaret => settings.labs.words_to_caret,
         }
+    }
+
+    /// Every feature's switch in `settings`, for the Labs lock
+    /// (`crate::policy`).
+    pub fn switches(settings: &mut AppSettings) -> Vec<&mut bool> {
+        let labs = &mut settings.labs;
+        vec![
+            &mut settings.meetings.enabled,
+            &mut settings.experimental.hex_microphone,
+            &mut settings.paste_with_shift,
+            &mut settings.keyboard_model_switching.enabled,
+            &mut settings.pause_browser_media,
+            &mut settings.share_dictation_shortcut,
+            &mut labs.playground,
+            &mut labs.live_text,
+            &mut labs.live_chapters,
+            &mut labs.vocabulary_biasing,
+            &mut labs.mouse_shortcuts,
+            &mut labs.unload_idle,
+            &mut labs.restore_shortcut_default,
+            &mut labs.keep_on_clipboard,
+            &mut labs.copy_only,
+            &mut labs.spoken_formatting,
+            &mut labs.filler_words,
+            &mut labs.subtitle_export,
+            &mut labs.second_dictation_shortcut,
+            &mut labs.smart_spacing,
+            &mut labs.spoken_symbols,
+            &mut labs.picker_sort_filter,
+            &mut labs.sided_modifier_chords,
+            &mut labs.tap_or_hold,
+            &mut labs.benchmark_details,
+            &mut labs.parakeet_ultra,
+            &mut labs.standalone_special_keys,
+            &mut labs.history_stats,
+            &mut labs.recent_dictations,
+            &mut labs.skip_pauses,
+            &mut labs.stop_when_call_ends,
+            &mut labs.output_fixes,
+            &mut labs.words_to_caret,
+        ]
+    }
+
+    /// The managed lock that holds this feature off, if any.
+    pub fn managed(self) -> Option<crate::policy::Lock> {
+        crate::policy::Policy::current().labs_lock(self)
     }
 
     pub fn set(self, settings: &mut AppSettings, on: bool) {
@@ -397,41 +528,57 @@ impl Feature {
             Self::SidedChords => settings.labs.sided_modifier_chords = on,
             Self::TapOrHold => settings.labs.tap_or_hold = on,
             Self::BenchmarkDetails => settings.labs.benchmark_details = on,
+            Self::ParakeetUltra => settings.labs.parakeet_ultra = on,
+            Self::HistoryStats => settings.labs.history_stats = on,
+            Self::RecentDictations => settings.labs.recent_dictations = on,
+            Self::SkipPauses => settings.labs.skip_pauses = on,
+            Self::StopWhenCallEnds => settings.labs.stop_when_call_ends = on,
+            Self::OutputFixes => settings.labs.output_fixes = on,
             Self::WordsToCaret => settings.labs.words_to_caret = on,
+            // Off, no shortcut keeps a key only the feature allows.
+            Self::StandaloneSpecialKeys => {
+                settings.labs.standalone_special_keys = on;
+                settings.repair_special_keys();
+            }
         }
     }
 }
 
 /// Set once this process knows its settings.
-const KNOWN: u32 = 1;
-const LIVE_TEXT: u32 = 1 << 1;
-const LIVE_CHAPTERS: u32 = 1 << 2;
-const PLAYGROUND: u32 = 1 << 3;
-const VOCABULARY_BIASING: u32 = 1 << 4;
-const MOUSE_SHORTCUTS: u32 = 1 << 5;
-const UNLOAD_IDLE: u32 = 1 << 6;
-const KEEP_ON_CLIPBOARD: u32 = 1 << 7;
-const COPY_ONLY: u32 = 1 << 8;
-const SPOKEN_FORMATTING: u32 = 1 << 9;
-const FILLER_WORDS: u32 = 1 << 10;
-const SUBTITLE_EXPORT: u32 = 1 << 11;
-const SMART_SPACING: u32 = 1 << 12;
-const SPOKEN_SYMBOLS: u32 = 1 << 13;
-const SIDED_CHORDS: u32 = 1 << 14;
-const TAP_OR_HOLD: u32 = 1 << 15;
-const WORDS_TO_CARET: u32 = 1 << 16;
-/// Unload-idle minutes sit above the switches.
-const MINUTES_SHIFT: u32 = 17;
+const KNOWN: u64 = 1;
+const LIVE_TEXT: u64 = 1 << 1;
+const LIVE_CHAPTERS: u64 = 1 << 2;
+const PLAYGROUND: u64 = 1 << 3;
+const VOCABULARY_BIASING: u64 = 1 << 4;
+const MOUSE_SHORTCUTS: u64 = 1 << 5;
+const UNLOAD_IDLE: u64 = 1 << 6;
+const KEEP_ON_CLIPBOARD: u64 = 1 << 7;
+const COPY_ONLY: u64 = 1 << 8;
+const SPOKEN_FORMATTING: u64 = 1 << 9;
+const FILLER_WORDS: u64 = 1 << 10;
+const SUBTITLE_EXPORT: u64 = 1 << 11;
+const SMART_SPACING: u64 = 1 << 12;
+const SPOKEN_SYMBOLS: u64 = 1 << 13;
+const SIDED_CHORDS: u64 = 1 << 14;
+const TAP_OR_HOLD: u64 = 1 << 15;
+const SKIP_PAUSES: u64 = 1 << 16;
+const PARAKEET_ULTRA: u64 = 1 << 17;
+const HISTORY_STATS: u64 = 1 << 18;
+const RECENT_DICTATIONS: u64 = 1 << 19;
+const STOP_WHEN_CALL_ENDS: u64 = 1 << 20;
+const WORDS_TO_CARET: u64 = 1 << 21;
+/// Unload-idle minutes (at most 1,440, 11 bits) sit above the switches.
+const MINUTES_SHIFT: u32 = 22;
 
 /// This process's `labs` switches: unknown until settings load or one is
 /// first read.
-static STATE: AtomicU32 = AtomicU32::new(0);
+static STATE: AtomicU64 = AtomicU64::new(0);
 
-fn on(bit: u32) -> bool {
+fn on(bit: u64) -> bool {
     state() & bit != 0
 }
 
-fn state() -> u32 {
+fn state() -> u64 {
     match STATE.load(Ordering::Acquire) {
         0 => {
             let saved = encode(&AppSettings::saved_labs());
@@ -527,11 +674,44 @@ pub fn tap_or_hold() -> bool {
     on(TAP_OR_HOLD)
 }
 
-/// A pasted dictation's words fly from the HUD to the text cursor (macOS;
-/// read as each paste commits).
+/// Parakeet Ultra joins the catalog (read wherever a model is listed,
+/// chosen, or run).
+pub fn parakeet_ultra() -> bool {
+    on(PARAKEET_ULTRA)
+}
+
+/// History's summary of retained dictations and `hex history stats` (read
+/// when the History pane reloads and when the command starts).
+pub fn history_stats() -> bool {
+    on(HISTORY_STATS)
+}
+
+/// The menu bar's Copy Recent Dictation submenu (macOS; read each time the
+/// menu opens).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn recent_dictations() -> bool {
+    on(RECENT_DICTATIONS)
+}
+
+/// A whole-clip dictation transcription hears only the head and tail of
+/// each long pause (Linux and Windows; read as each whole-clip run starts).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn skip_pauses() -> bool {
+    on(SKIP_PAUSES) && Feature::SkipPauses.on_this_os()
+}
+
+/// A meeting recording Hex started on its own stops once its call app has
+/// left the microphone and gone quiet for a grace period (macOS; read on
+/// each pass of the meeting controller).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn stop_when_call_ends() -> bool {
+    on(STOP_WHEN_CALL_ENDS) && Feature::StopWhenCallEnds.on_this_os()
+}
+
+/// The homepage character speaks toward the insertion point (macOS).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn words_to_caret() -> bool {
-    on(WORDS_TO_CARET)
+    on(WORDS_TO_CARET) && Feature::WordsToCaret.on_this_os()
 }
 
 /// How long the speech model may sit unused before the engine unloads it,
@@ -539,7 +719,7 @@ pub fn words_to_caret() -> bool {
 pub fn unload_idle() -> Option<std::time::Duration> {
     let state = state();
     (state & UNLOAD_IDLE != 0)
-        .then(|| std::time::Duration::from_secs(u64::from(state >> MINUTES_SHIFT) * 60))
+        .then(|| std::time::Duration::from_secs((state >> MINUTES_SHIFT) * 60))
 }
 
 /// Records the switches the loaded or saved settings hold.
@@ -547,14 +727,17 @@ pub(crate) fn apply(settings: &LabsSettings) {
     STATE.store(encode(settings), Ordering::Release);
 }
 
-fn encode(settings: &LabsSettings) -> u32 {
-    encode_where(settings, Feature::shipped)
+fn encode(settings: &LabsSettings) -> u64 {
+    let policy = crate::policy::Policy::current();
+    encode_where(settings, |feature| {
+        feature.shipped() && policy.labs_lock(feature).is_none()
+    })
 }
 
 /// The switches `settings` hold for the features `reaches` admits; the
 /// rest read off while their saved setting stays as it is.
-fn encode_where(settings: &LabsSettings, reaches: impl Fn(Feature) -> bool) -> u32 {
-    let minutes = settings.unload_idle_minutes.clamp(1, 24 * 60) << MINUTES_SHIFT;
+fn encode_where(settings: &LabsSettings, reaches: impl Fn(Feature) -> bool) -> u64 {
+    let minutes = u64::from(settings.unload_idle_minutes.clamp(1, 24 * 60)) << MINUTES_SHIFT;
     [
         (Feature::LiveText, settings.live_text, LIVE_TEXT),
         (Feature::LiveChapters, settings.live_chapters, LIVE_CHAPTERS),
@@ -603,6 +786,23 @@ fn encode_where(settings: &LabsSettings, reaches: impl Fn(Feature) -> bool) -> u
             Feature::WordsToCaret,
             settings.words_to_caret,
             WORDS_TO_CARET,
+        ),
+        (
+            Feature::ParakeetUltra,
+            settings.parakeet_ultra,
+            PARAKEET_ULTRA,
+        ),
+        (Feature::HistoryStats, settings.history_stats, HISTORY_STATS),
+        (
+            Feature::RecentDictations,
+            settings.recent_dictations,
+            RECENT_DICTATIONS,
+        ),
+        (Feature::SkipPauses, settings.skip_pauses, SKIP_PAUSES),
+        (
+            Feature::StopWhenCallEnds,
+            settings.stop_when_call_ends,
+            STOP_WHEN_CALL_ENDS,
         ),
     ]
     .into_iter()
@@ -656,7 +856,8 @@ pub fn run(command: Option<&LabsCommand>) -> Result<()> {
         );
         return Ok(());
     }
-    let mut settings = AppSettings::load()?;
+    // Listing, or handing the change to a running Hex, never writes the file.
+    let settings = AppSettings::read()?;
     let (name, on) = match command {
         None | Some(LabsCommand::List) => {
             print!("{}", list(&settings));
@@ -667,7 +868,14 @@ pub fn run(command: Option<&LabsCommand>) -> Result<()> {
         Some(LabsCommand::On { feature }) => (feature, true),
         Some(LabsCommand::Off { feature }) => (feature, false),
     };
+    if let Some((_, note)) = GRADUATED.iter().find(|(graduated, _)| *graduated == name) {
+        println!("{note}");
+        return Ok(());
+    }
     let feature = resolve(name, Feature::shipped)?;
+    if let Some(lock) = feature.managed() {
+        return Err(eyre!(lock.refusal()));
+    }
     if feature == Feature::VoiceFilter
         && !on
         && crate::audio::hex_microphone::driver_bundle_installed()
@@ -675,6 +883,9 @@ pub fn run(command: Option<&LabsCommand>) -> Result<()> {
         return Err(eyre!(
             "voice-filter stays on while the Hex Microphone driver is installed; uninstall the driver in its pane to turn it off"
         ));
+    }
+    if !on && let Some(why) = feature.off_refusal(&settings) {
+        return Err(eyre!(why));
     }
     let state = if on { "on" } else { "off" };
     // A running Hex saves and applies it at once, as its Labs row would.
@@ -690,6 +901,7 @@ pub fn run(command: Option<&LabsCommand>) -> Result<()> {
             }
         };
     }
+    let mut settings = AppSettings::load()?;
     if feature.on(&settings) == on {
         println!("{} is already {state}.", feature.name());
         return Ok(());
@@ -701,7 +913,16 @@ pub fn run(command: Option<&LabsCommand>) -> Result<()> {
 }
 
 /// The feature `name` names, if this OS has it and `reaches` admits it.
+/// Features that left Labs: `hex labs` still knows their names.
+const GRADUATED: [(&str, &str); 1] = [(
+    "custom-models",
+    "custom-models graduated: adding a model file and models found on this computer are always on now",
+)];
+
 fn resolve(name: &str, reaches: impl Fn(Feature) -> bool + Copy) -> Result<Feature> {
+    if let Some((_, note)) = GRADUATED.iter().find(|(graduated, _)| *graduated == name) {
+        return Err(eyre!("{note}"));
+    }
     Feature::from_name(name)
         .filter(|feature| feature.on_this_os() && reaches(*feature))
         .ok_or_else(|| {
@@ -726,9 +947,15 @@ fn list(settings: &AppSettings) -> String {
             || (feature == Feature::VoiceFilter
                 && crate::audio::hex_microphone::driver_bundle_installed());
         out.push_str(&format!(
-            "{:<width$}  {:<3}  {:<8}  {} (hex settings {})\n",
+            "{:<width$}  {:<7}  {:<8}  {} (hex settings {})\n",
             feature.name(),
-            if on { "on" } else { "off" },
+            if feature.managed().is_some() {
+                "managed"
+            } else if on {
+                "on"
+            } else {
+                "off"
+            },
             feature.audience().name(),
             feature.description(),
             feature.settings_key(),
@@ -748,6 +975,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn graduated_features_answer_by_name() {
+        let error = resolve("custom-models", |_| true).unwrap_err().to_string();
+        assert!(error.contains("graduated"), "{error}");
+        assert_eq!(Feature::from_name("custom-models"), None);
+    }
+
+    #[test]
     fn every_feature_is_off_by_default_and_round_trips() {
         let mut settings = AppSettings::default();
         for feature in Feature::ALL {
@@ -760,6 +994,22 @@ mod tests {
             feature.set(&mut settings, true);
             assert!(feature.on(&settings));
         }
+    }
+
+    #[test]
+    fn switches_hold_every_feature() {
+        let mut settings = AppSettings::default();
+        for switch in Feature::switches(&mut settings) {
+            *switch = true;
+        }
+        for feature in Feature::ALL {
+            assert!(feature.on(&settings), "{} has no switch", feature.name());
+        }
+        assert_eq!(
+            Feature::switches(&mut settings).len(),
+            Feature::ALL.len(),
+            "one switch per feature"
+        );
     }
 
     #[test]
@@ -791,18 +1041,6 @@ mod tests {
         assert_ne!(state & FILLER_WORDS, 0);
         assert_ne!(encode_where(&labs, |_| true) & LIVE_TEXT, 0);
         assert!(labs.live_text, "the saved setting is kept");
-    }
-
-    #[test]
-    fn words_to_caret_runs_only_in_dev_builds() {
-        assert_eq!(Feature::WordsToCaret.audience(), Audience::Dev);
-        let labs = LabsSettings {
-            words_to_caret: true,
-            ..LabsSettings::default()
-        };
-        let reaches = |dev_build| move |feature: Feature| feature.audience().reaches(dev_build);
-        assert_eq!(encode_where(&labs, reaches(false)) & WORDS_TO_CARET, 0);
-        assert_ne!(encode_where(&labs, reaches(true)) & WORDS_TO_CARET, 0);
     }
 
     #[test]
@@ -918,16 +1156,95 @@ mod tests {
     }
 
     #[test]
+    fn history_stats_is_its_own_bit_and_off_by_default() {
+        let mut labs = LabsSettings::default();
+        assert_eq!(encode_where(&labs, |_| true) & HISTORY_STATS, 0);
+        labs.history_stats = true;
+        labs.unload_idle_minutes = 24 * 60;
+        let state = encode_where(&labs, |_| true);
+        assert_ne!(state & HISTORY_STATS, 0);
+        assert_eq!(state & PARAKEET_ULTRA, 0);
+        assert_eq!(state >> MINUTES_SHIFT, 24 * 60);
+    }
+
+    #[test]
+    fn recent_dictations_is_its_own_bit_and_off_by_default() {
+        let mut labs = LabsSettings::default();
+        assert_eq!(encode_where(&labs, |_| true) & RECENT_DICTATIONS, 0);
+        labs.recent_dictations = true;
+        labs.unload_idle_minutes = 24 * 60;
+        let state = encode_where(&labs, |_| true);
+        assert_ne!(state & RECENT_DICTATIONS, 0);
+        assert_eq!(state & HISTORY_STATS, 0);
+        assert_eq!(state >> MINUTES_SHIFT, 24 * 60);
+    }
+
+    #[test]
+    fn skip_pauses_is_its_own_bit_and_off_by_default() {
+        let mut labs = LabsSettings::default();
+        assert_eq!(encode_where(&labs, |_| true) & SKIP_PAUSES, 0);
+        labs.skip_pauses = true;
+        labs.unload_idle_minutes = 24 * 60;
+        let state = encode_where(&labs, |_| true);
+        assert_ne!(state & SKIP_PAUSES, 0);
+        assert_eq!(state & TAP_OR_HOLD, 0);
+        assert_eq!(state & PARAKEET_ULTRA, 0);
+        assert_eq!(state >> MINUTES_SHIFT, 24 * 60);
+    }
+
+    #[test]
+    fn stop_when_call_ends_is_its_own_bit_and_off_by_default() {
+        let mut labs = LabsSettings::default();
+        assert_eq!(encode_where(&labs, |_| true) & STOP_WHEN_CALL_ENDS, 0);
+        labs.stop_when_call_ends = true;
+        labs.unload_idle_minutes = 24 * 60;
+        let state = encode_where(&labs, |_| true);
+        assert_ne!(state & STOP_WHEN_CALL_ENDS, 0);
+        assert_eq!(state & RECENT_DICTATIONS, 0);
+        assert_eq!(state >> MINUTES_SHIFT, 24 * 60);
+    }
+
+    #[test]
     fn words_to_caret_is_its_own_bit_and_off_by_default() {
         let mut labs = LabsSettings::default();
-        assert_eq!(encode(&labs) & WORDS_TO_CARET, 0);
+        assert_eq!(encode_where(&labs, |_| true) & WORDS_TO_CARET, 0);
         labs.words_to_caret = true;
         labs.unload_idle_minutes = 24 * 60;
-        let state = encode(&labs);
+        let state = encode_where(&labs, |_| true);
         assert_ne!(state & WORDS_TO_CARET, 0);
-        assert_eq!(state & SMART_SPACING, 0);
-        assert_eq!(state & SPOKEN_SYMBOLS, 0);
+        assert_eq!(state & STOP_WHEN_CALL_ENDS, 0);
+        assert_eq!(state & SKIP_PAUSES, 0);
         assert_eq!(state >> MINUTES_SHIFT, 24 * 60);
+    }
+
+    #[test]
+    fn words_to_caret_reaches_every_build_on_macos() {
+        assert_eq!(Feature::WordsToCaret.audience(), Audience::Everyone);
+        assert_eq!(
+            Feature::WordsToCaret.on_this_os(),
+            cfg!(target_os = "macos")
+        );
+        let labs = LabsSettings {
+            words_to_caret: true,
+            ..LabsSettings::default()
+        };
+        for dev_build in [false, true] {
+            let state = encode_where(&labs, |feature| feature.audience().reaches(dev_build));
+            assert_ne!(state & WORDS_TO_CARET, 0);
+        }
+    }
+
+    #[test]
+    fn all_switches_fit_below_the_idle_minutes() {
+        let mut settings = AppSettings::default();
+        for switch in Feature::switches(&mut settings) {
+            *switch = true;
+        }
+        settings.labs.unload_idle_minutes = 24 * 60;
+        let state = encode_where(&settings.labs, |_| true);
+        assert_eq!(state & ((1 << MINUTES_SHIFT) - 1), (1 << MINUTES_SHIFT) - 1);
+        assert_eq!(state >> MINUTES_SHIFT, 24 * 60);
+        assert!(state > u64::from(u32::MAX));
     }
 
     #[test]

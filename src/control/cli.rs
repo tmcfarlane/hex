@@ -60,10 +60,10 @@ pub enum ControlCli {
         #[command(flatten)]
         output: Output,
     },
-    /// Start, stop, cancel, or toggle a dictation, as the shortcut would.
+    /// Start, stop, or toggle a dictation, as the shortcut would.
     ///
-    /// `start` locks the recording: `stop` or the shortcut finishes it,
-    /// `cancel` or Escape discards it. Repeating a command changes nothing.
+    /// `start` locks the recording: `stop` or the shortcut finishes it.
+    /// Repeating a command changes nothing.
     Dictation {
         #[arg(value_enum)]
         action: CaptureAction,
@@ -89,7 +89,8 @@ pub enum ControlCli {
         #[command(subcommand)]
         command: SettingsCommand,
     },
-    /// List, switch, and install transcription models.
+    /// List, switch, install, and import transcription models.
+    #[command(visible_alias = "models")]
     Model {
         #[command(subcommand)]
         command: ModelCommand,
@@ -99,7 +100,7 @@ pub enum ControlCli {
         #[command(subcommand)]
         command: WindowCommand,
     },
-    /// Replay the first-run onboarding (needs Labs on).
+    /// Replay the first-run onboarding.
     Onboarding {
         #[command(subcommand)]
         command: OnboardingCommand,
@@ -279,6 +280,21 @@ pub enum ModelCommand {
         #[arg(long)]
         language: Option<String>,
     },
+    /// Copy a GGUF speech model into Hex after checking its header,
+    /// and print its id. The original is left as it is.
+    Import {
+        path: std::path::PathBuf,
+        /// The name the picker shows (default: the file's general.name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Rename an imported or found model.
+    Rename { model: String, name: String },
+    /// Check Hex's copy of an import (or a found file) again; a copy whose contents
+    /// still match is ready again.
+    Repair { model: String },
+    /// Remove Hex's copy of an imported model, or forget a found one (its file stays).
+    Remove { model: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -367,6 +383,10 @@ pub fn run(command: ControlCli) -> u8 {
         ControlCli::Quit { force, output } => send(ControlCommand::Quit { force }, output),
         ControlCli::Restart { force, output } => {
             if !running() {
+                #[cfg(target_os = "linux")]
+                if crate::linux::service::instance_answers() {
+                    return print(restart_older_hex(), output);
+                }
                 return start(output);
             }
             #[cfg(target_os = "linux")]
@@ -391,11 +411,18 @@ pub fn run(command: ControlCli) -> u8 {
             raw,
             output,
         } => {
-            if let Err(error) = super::check_flags(action, print, raw) {
+            if let Err(error) = super::check_flags(action.into(), print, raw) {
                 eprintln!("hex: {}", error.message);
                 return 2;
             }
-            send(ControlCommand::Dictation { action, print, raw }, output)
+            send(
+                ControlCommand::Dictation {
+                    action: action.into(),
+                    print,
+                    raw,
+                },
+                output,
+            )
         }
         ControlCli::PasteLast { output } => send(ControlCommand::PasteLast, output),
         ControlCli::Settings { command } => settings(command),
@@ -412,6 +439,34 @@ pub fn run(command: ControlCli) -> u8 {
                 output,
             } => install_model(model, language, output),
             ModelCommand::Cancel { output } => send(ControlCommand::ModelCancel, output),
+            ModelCommand::Import { path, name } => report(import_model(&path, name.as_deref())),
+            ModelCommand::Rename { model, name } => report(imported(&model).and_then(|id| {
+                crate::transcription::custom_models::rename(id, &name)?;
+                println!("renamed\t{}", id.as_str());
+                Ok(())
+            })),
+            ModelCommand::Repair { model } => report(imported(&model).and_then(|id| {
+                crate::transcription::custom_models::repair(
+                    id,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )?;
+                println!("ready\t{}", id.as_str());
+                Ok(())
+            })),
+            ModelCommand::Remove { model } => report(imported(&model).and_then(|id| {
+                let settings = crate::app_settings::AppSettings::load().unwrap_or_default();
+                if settings.transcription.model
+                    == crate::transcription::models::TranscriptionModelId::Custom(id)
+                {
+                    color_eyre::eyre::bail!(
+                        "{} is the selected model; choose another with `hex model use` first",
+                        id.as_str()
+                    );
+                }
+                crate::transcription::custom_models::remove(id)?;
+                println!("removed\t{}", id.as_str());
+                Ok(())
+            })),
             command => offline_model(command),
         },
         ControlCli::Window { command } => match command {
@@ -490,7 +545,7 @@ pub fn run(command: ControlCli) -> u8 {
 fn install_model(model: Option<String>, language: Option<String>, output: Output) -> u8 {
     let model = match model {
         Some(model) => model,
-        None => match crate::app_settings::AppSettings::load() {
+        None => match crate::app_settings::AppSettings::read() {
             Ok(settings) => settings.transcription.model.as_str().to_owned(),
             Err(error) => return fail(&format!("couldn't read settings: {error:#}")),
         },
@@ -507,6 +562,26 @@ fn install_model(model: Option<String>, language: Option<String>, output: Output
     send(ControlCommand::ModelInstall { model, language }, output)
 }
 
+/// `hex model import`: checks, copies, and records the file here, in this
+/// process; a running Hex lists it at once.
+fn import_model(path: &std::path::Path, name: Option<&str>) -> color_eyre::Result<()> {
+    use crate::transcription::custom_models;
+    let id = custom_models::import(path, name, &std::sync::atomic::AtomicBool::new(false))?;
+    let definition = custom_models::definition(id);
+    println!("imported\t{}\t{}", id.as_str(), definition.name);
+    Ok(())
+}
+
+/// The import or found model in use that `model` names.
+fn imported(model: &str) -> color_eyre::Result<crate::transcription::models::CustomModelId> {
+    use crate::transcription::custom_models;
+    crate::transcription::models::CustomModelId::parse(model)
+        .filter(|id| custom_models::is_registered(*id))
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!("no imported model is {model}; run `hex model list`")
+        })
+}
+
 /// The selection a local model command names: `model` with its remembered
 /// language unless `language` is given, or the selected model.
 #[cfg(not(target_os = "macos"))]
@@ -514,7 +589,7 @@ fn selection(
     model: Option<String>,
     language: Option<String>,
 ) -> color_eyre::Result<crate::transcription::models::TranscriptionSelection> {
-    let settings = crate::app_settings::AppSettings::load().unwrap_or_default();
+    let settings = crate::app_settings::AppSettings::read().unwrap_or_default();
     let model = model.unwrap_or_else(|| settings.transcription.model.as_str().to_owned());
     super::model_selection(&settings, &model, language.as_deref())
         .map_err(|error| color_eyre::eyre::eyre!(error.message))
@@ -648,6 +723,12 @@ pub enum CaptureCommand {
         #[command(flatten)]
         output: Output,
     },
+    /// Stop the capture that records, else start one (for a key that fires
+    /// on the press only).
+    Toggle {
+        #[command(flatten)]
+        output: Output,
+    },
     /// What records, what is being written, and the last capture.
     Status {
         #[command(flatten)]
@@ -740,6 +821,7 @@ pub fn capture(command: CaptureCommand) -> u8 {
         CaptureCommand::Start { output, .. } => (C::ScrawlCapture { action: A::Start }, output),
         CaptureCommand::Stop { output } => (C::ScrawlCapture { action: A::Stop }, output),
         CaptureCommand::Cancel { output } => (C::ScrawlCapture { action: A::Cancel }, output),
+        CaptureCommand::Toggle { output } => (C::ScrawlCapture { action: A::Toggle }, output),
         CaptureCommand::Status { output } => (C::ScrawlCapture { action: A::Status }, output),
         CaptureCommand::List { limit, output } => (C::ScrawlCaptureList { limit }, output),
         CaptureCommand::Show { capture, output } => (C::ScrawlCaptureShow { capture }, output),
@@ -846,6 +928,10 @@ fn apply_settings(file: &std::path::Path, output: Output) -> u8 {
         match lock {
             Ok(_lock) if !running() => return print(apply_offline(&values), output),
             Ok(_) => {}
+            #[cfg(target_os = "linux")]
+            Err(_) if crate::linux::service::instance_answers() => {
+                return print(older_hex(), output);
+            }
             Err(_) if std::time::Instant::now() >= deadline => {
                 return print(
                     ControlReply::error(
@@ -922,7 +1008,7 @@ pub(crate) fn set_in_running_hex(key: &str, value: &str) -> Option<ControlReply>
 
 fn call(request: ControlRequest) -> Result<ControlResponse, ControlReply> {
     if !running() {
-        return Err(not_running());
+        return Err(absent());
     }
     crate::local_api::call_control(&request)
         .map_err(|error| ControlReply::error("transport", format!("{error:#}")))
@@ -930,6 +1016,50 @@ fn call(request: ControlRequest) -> Result<ControlResponse, ControlReply> {
 
 pub(crate) fn not_running() -> ControlReply {
     ControlReply::error("not-running", "Hex is not running; run `hex start`")
+}
+
+/// Why no Hex answered `/control`: on Linux an older Hex an update left
+/// running answers only on its socket (#915).
+fn absent() -> ControlReply {
+    #[cfg(target_os = "linux")]
+    if crate::linux::service::instance_answers() {
+        return older_hex();
+    }
+    not_running()
+}
+
+/// An older Hex that predates `hex` commands over the local API.
+#[cfg(target_os = "linux")]
+fn older_hex() -> ControlReply {
+    ControlReply::error(
+        "outdated",
+        "an older Hex is still running (Hex was updated) and doesn't take `hex` commands; run `hex restart`",
+    )
+}
+
+/// `hex restart` with an older Hex running: restarts its systemd unit into
+/// the installed build, then waits until the new Hex answers.
+#[cfg(target_os = "linux")]
+fn restart_older_hex() -> ControlReply {
+    use std::time::{Duration, Instant};
+
+    if !crate::linux::service::supervised() {
+        return ControlReply::error(
+            "failed",
+            "an older Hex is running outside its systemd unit; quit it from its window or tray, then run `hex start`",
+        );
+    }
+    if let Err(error) = crate::linux::service::restart() {
+        return ControlReply::error("failed", format!("{error:#}"));
+    }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(20) {
+        if running() {
+            return ControlReply::done("Restarted Hex");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    ControlReply::done("Restarted Hex; it isn't answering yet (it may be loading its model)")
 }
 
 #[cfg(target_os = "macos")]
@@ -989,6 +1119,10 @@ fn start_reply() -> ControlReply {
 
     if running() {
         return ControlReply::unchanged("Hex is already running");
+    }
+    #[cfg(target_os = "linux")]
+    if crate::linux::service::instance_answers() {
+        return older_hex();
     }
     let executable = match std::env::current_exe() {
         Ok(executable) => executable,
@@ -1189,6 +1323,17 @@ mod tests {
             exit_code(&ControlReply::error("no-speech", "x")),
             EXIT_NO_SPEECH
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_older_hex_is_not_reported_as_not_running() {
+        let reply = older_hex();
+        assert_eq!(exit_code(&reply), EXIT_REFUSED);
+        assert!(matches!(
+            &reply,
+            ControlReply::Error { code, message } if code == "outdated" && message.contains("hex restart")
+        ));
     }
 
     #[cfg(target_os = "macos")]

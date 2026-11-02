@@ -2,7 +2,6 @@ use crate::durable::{sync_directory, sync_file};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
@@ -13,29 +12,59 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+use super::artifacts::{
+    COHERE_ARTIFACT, COHERE_LANGUAGES, GIGAAM_V3_E2E_RNNT_ARTIFACT, IVRIT_WHISPER_ARTIFACT,
+    NEMOTRON_3_5_ASR_ARTIFACT, NEMOTRON_3_5_LANGUAGES, NEMOTRON_3_5_LOCALES,
+    PARAKEET_ULTRA_ARTIFACT, PARAKEET_UNIFIED_ENGLISH_ARTIFACT, PARAKEET_V2_ARTIFACT,
+    PARAKEET_V3_ARTIFACT, PARAKEET_V3_LANGUAGES, QWEN_ARTIFACT, QWEN_LANGUAGES, QWENCLEO_ARTIFACT,
+    SENSEVOICE_ARTIFACT, UNDERDOG_BARK_3_CLEAN_ARTIFACT, UNDERDOG_BARK_3_PRO_ARTIFACT,
+    WHISPER_ARTIFACT,
+};
+pub use super::custom_models::CustomModelId;
+pub use super::languages::{LANGUAGES, language_name};
+pub(crate) use super::model_benchmarks::most_accurate_is_comparable;
+pub use super::model_benchmarks::{BenchmarkRecord, benchmark};
+
+/// A catalog model, or one imported or found on this computer.
+/// Saved as its wire name (`parakeet_v3`, `custom-<16 hex digits>`); a name
+/// this build doesn't know fails to decode, so the lenient settings loader
+/// keeps the default for it without rewriting the file (#744).
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum TranscriptionModelId {
     #[default]
-    #[serde(rename = "parakeet_unified_en")]
     ParakeetUnifiedEnglish,
     ParakeetV2,
     ParakeetV3,
     WhisperLargeV3Turbo,
     Qwen3Asr06B,
-    #[serde(rename = "qwencleo_asr_1_7b")]
     QwenCleoAsr17B,
+    IvritWhisperLargeV3Turbo,
     SenseVoiceSmall,
     CohereTranscribe,
-    #[serde(rename = "underdog_bark_3_pro")]
     UnderdogBark3Pro,
-    #[serde(rename = "underdog_bark_3_clean")]
     UnderdogBark3Clean,
+    ParakeetUltra,
+    Nemotron35Asr,
+    GigaAmV3,
     AppleSpeech,
+    Custom(CustomModelId),
+}
+
+impl Serialize for TranscriptionModelId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TranscriptionModelId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        name.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 impl TranscriptionModelId {
-    pub const fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::ParakeetUnifiedEnglish => "parakeet_unified_en",
             Self::ParakeetV2 => "parakeet_v2",
@@ -43,12 +72,28 @@ impl TranscriptionModelId {
             Self::WhisperLargeV3Turbo => "whisper_large_v3_turbo",
             Self::Qwen3Asr06B => "qwen3_asr06_b",
             Self::QwenCleoAsr17B => "qwencleo_asr_1_7b",
+            Self::IvritWhisperLargeV3Turbo => "ivrit_whisper_large_v3_turbo",
             Self::SenseVoiceSmall => "sense_voice_small",
             Self::CohereTranscribe => "cohere_transcribe",
             Self::UnderdogBark3Pro => "underdog_bark_3_pro",
             Self::UnderdogBark3Clean => "underdog_bark_3_clean",
+            Self::ParakeetUltra => "parakeet_ultra",
+            Self::Nemotron35Asr => "nemotron_3_5_asr",
+            Self::GigaAmV3 => "gigaam_v3",
             Self::AppleSpeech => "apple_speech",
+            Self::Custom(id) => id.as_str(),
         }
+    }
+
+    pub const fn is_custom(self) -> bool {
+        matches!(self, Self::Custom(_))
+    }
+
+    /// A model behind its own Labs toggle: an import, or Parakeet Ultra. A
+    /// saved choice of one stays saved while it can't run, and the listener
+    /// runs a fallback (`custom_models::runnable`).
+    pub const fn is_labs_gated(self) -> bool {
+        matches!(self, Self::Custom(_) | Self::ParakeetUltra)
     }
 }
 
@@ -63,12 +108,18 @@ impl FromStr for TranscriptionModelId {
             "whisper_large_v3_turbo" => Ok(Self::WhisperLargeV3Turbo),
             "qwen3_asr06_b" => Ok(Self::Qwen3Asr06B),
             "qwencleo_asr_1_7b" => Ok(Self::QwenCleoAsr17B),
+            "ivrit_whisper_large_v3_turbo" => Ok(Self::IvritWhisperLargeV3Turbo),
             "sense_voice_small" => Ok(Self::SenseVoiceSmall),
             "cohere_transcribe" => Ok(Self::CohereTranscribe),
             "underdog_bark_3_pro" => Ok(Self::UnderdogBark3Pro),
             "underdog_bark_3_clean" => Ok(Self::UnderdogBark3Clean),
+            "parakeet_ultra" => Ok(Self::ParakeetUltra),
+            "nemotron_3_5_asr" => Ok(Self::Nemotron35Asr),
+            "gigaam_v3" => Ok(Self::GigaAmV3),
             "apple_speech" => Ok(Self::AppleSpeech),
-            _ => Err(eyre!("unknown transcription model: {value}")),
+            _ => CustomModelId::parse(value)
+                .map(Self::Custom)
+                .ok_or_else(|| eyre!("unknown transcription model: {value}")),
         }
     }
 }
@@ -127,17 +178,6 @@ pub enum Recommendation {
     Vocabulary,
 }
 
-impl Recommendation {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Recommended => "Recommended",
-            Self::Fastest => "Fastest",
-            Self::MostAccurate => "Most accurate",
-            Self::Vocabulary => "Uses vocabulary",
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct ModelChoice {
     pub model: &'static ModelDefinition,
@@ -148,12 +188,9 @@ pub struct ModelDefinition {
     pub id: TranscriptionModelId,
     pub name: &'static str,
     pub realtime: &'static str,
-    /// Word error rate on the `quality_context` benchmark, in percent;
+    /// Word error rate on the model's own benchmark, in percent;
     /// `None` when the system manages the model and publishes none.
     pub word_error_rate: Option<f64>,
-    pub quality_context: &'static str,
-    pub coverage: &'static str,
-    pub timestamps: &'static str,
     /// The pinned artifact advertises streaming, so dictation can transcribe
     /// while the shortcut is held. It still streams only on a GPU device and
     /// after its load probe succeeds; otherwise it transcribes the whole clip.
@@ -201,8 +238,18 @@ impl GgufArtifact {
 }
 
 impl ModelDefinition {
-    pub const fn available(&self) -> bool {
-        !matches!(self.runtime, ModelRuntime::AppleSpeech)
+    /// A catalog GGUF model, or an import that is on, present, and unchanged.
+    pub fn available(&self) -> bool {
+        match (self.runtime, self.id) {
+            (ModelRuntime::AppleSpeech, _) => false,
+            (ModelRuntime::Gguf(_), TranscriptionModelId::Custom(id)) => {
+                super::custom_models::usable(id)
+            }
+            (ModelRuntime::Gguf(_), TranscriptionModelId::ParakeetUltra) => {
+                crate::labs::parakeet_ultra()
+            }
+            (ModelRuntime::Gguf(_), _) => true,
+        }
     }
 
     pub fn supports_language(&self, language: &str) -> bool {
@@ -214,10 +261,14 @@ impl ModelDefinition {
     }
 
     pub fn runtime_language<'a>(&self, language: &'a str) -> &'a str {
-        if self.id == TranscriptionModelId::WhisperLargeV3Turbo && language == "fil" {
-            "tl"
-        } else {
-            language
+        match self.id {
+            TranscriptionModelId::WhisperLargeV3Turbo if language == "fil" => "tl",
+            // Its prompt and advertised languages are locales: `de-DE`.
+            TranscriptionModelId::Nemotron35Asr => NEMOTRON_3_5_LOCALES
+                .iter()
+                .find_map(|(code, locale)| (*code == language).then_some(*locale))
+                .unwrap_or(language),
+            _ => language,
         }
     }
 
@@ -264,11 +315,6 @@ impl ModelDefinition {
             .collect()
     }
 
-    /// Benchmark accuracy, the inverse of its word error rate: `98.4%`.
-    pub fn accuracy_label(&self) -> Option<String> {
-        self.word_error_rate.map(accuracy_label)
-    }
-
     pub fn size_label(&self) -> String {
         match self.runtime {
             ModelRuntime::AppleSpeech => "Managed".into(),
@@ -308,257 +354,6 @@ impl ModelDefinition {
     }
 }
 
-fn accuracy_label(word_error_rate: f64) -> String {
-    format!("{:.1}%", (100.0 - word_error_rate).clamp(0.0, 100.0))
-}
-
-/// The error measure a benchmark reports; lower is better for both.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ErrorMetric {
-    /// Word error rate.
-    Wer,
-    /// Character error rate, for languages written without spaces.
-    Cer,
-}
-
-impl ErrorMetric {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Wer => "WER",
-            Self::Cer => "CER",
-        }
-    }
-}
-
-/// Where one model's error rate comes from, as Labs › Benchmark details
-/// shows it. Every `None` is something the source did not record and the
-/// picker says is unknown; nothing is guessed. Speed figures (`realtime`)
-/// have no record: they are upstream figures whose hardware and method are
-/// unknown.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BenchmarkRecord {
-    pub metric: ErrorMetric,
-    /// In percent.
-    pub value: f64,
-    /// The language code the benchmark measured.
-    pub language: &'static str,
-    /// The dataset and its split, such as "FLEURS test".
-    pub dataset: Option<&'static str>,
-    /// Plain text naming where the figure comes from.
-    pub source: Option<&'static str>,
-    /// The source record's revision; not an inference run.
-    pub source_revision: Option<&'static str>,
-    pub utterances: Option<u32>,
-    pub batch_size: Option<u32>,
-    /// Whether the run asked for timestamps.
-    pub timestamps: Option<bool>,
-    pub hardware: Option<&'static str>,
-}
-
-impl BenchmarkRecord {
-    /// A record whose source, dataset, and conditions were not recorded.
-    const fn unrecorded(metric: ErrorMetric, value: f64, language: &'static str) -> Self {
-        Self {
-            metric,
-            value,
-            language,
-            dataset: None,
-            source: None,
-            source_revision: None,
-            utterances: None,
-            batch_size: None,
-            timestamps: None,
-            hardware: None,
-        }
-    }
-
-    /// The raw figure: `7.57% CER`.
-    pub fn rate_label(&self) -> String {
-        format!("{:.2}% {}", self.value, self.metric.label())
-    }
-
-    /// Whether the two figures measure the same thing on the same data, so
-    /// one may be called better than the other. An unknown dataset matches
-    /// nothing.
-    pub fn comparable(&self, other: &Self) -> bool {
-        self.metric == other.metric
-            && self.language == other.language
-            && self.dataset.is_some()
-            && self.dataset == other.dataset
-    }
-}
-
-/// The transcription runtime's structured records for its Mandarin FLEURS
-/// runs, both legacy-published with no engine revision: the original run
-/// IDs and scoring or artifact revisions are unknown. The catalog's
-/// `word_error_rate` keeps the narrative figures (7.64 and 10.11) as
-/// alternate legacy values; cards with the Lab on show these instead.
-const MANDARIN_FLEURS_SOURCE: &str = "transcribe.cpp benchmark record, legacy-published";
-const MANDARIN_FLEURS_REVISION: &str = "7045d1c";
-
-const QWEN3_ASR_RECORD: BenchmarkRecord = BenchmarkRecord {
-    metric: ErrorMetric::Cer,
-    value: 7.57,
-    language: "zh",
-    dataset: Some("FLEURS test"),
-    source: Some(MANDARIN_FLEURS_SOURCE),
-    source_revision: Some(MANDARIN_FLEURS_REVISION),
-    utterances: Some(945),
-    batch_size: Some(8),
-    timestamps: Some(false),
-    hardware: None,
-};
-const SENSEVOICE_RECORD: BenchmarkRecord = BenchmarkRecord {
-    value: 10.12,
-    ..QWEN3_ASR_RECORD
-};
-const QWENCLEO_RECORD: BenchmarkRecord = BenchmarkRecord {
-    dataset: Some("Author's Egyptian Arabic test"),
-    source: Some("The model author's own evaluation"),
-    utterances: Some(3_699),
-    ..BenchmarkRecord::unrecorded(ErrorMetric::Wer, 19.85, "ar")
-};
-
-/// `model`'s benchmark record, or `None` when the system manages the model
-/// and publishes no figure (Apple Speech).
-pub fn benchmark(model: &ModelDefinition) -> Option<BenchmarkRecord> {
-    match model.id {
-        TranscriptionModelId::Qwen3Asr06B => Some(QWEN3_ASR_RECORD),
-        TranscriptionModelId::SenseVoiceSmall => Some(SENSEVOICE_RECORD),
-        TranscriptionModelId::QwenCleoAsr17B => Some(QWENCLEO_RECORD),
-        // The catalog's English figures: their dataset, source, and
-        // conditions were not recorded.
-        _ => model
-            .word_error_rate
-            .map(|rate| BenchmarkRecord::unrecorded(ErrorMetric::Wer, rate, "en")),
-    }
-}
-
-/// Whether `model` may keep a "Most accurate" badge for `language` with
-/// Labs › Benchmark details on: it has a record, and every other
-/// recommended model for the language that has one is comparable to it.
-pub(crate) fn most_accurate_is_comparable(model: &ModelDefinition, language: &str) -> bool {
-    let Some(record) = benchmark(model) else {
-        return false;
-    };
-    record.dataset.is_some()
-        && choices_for_runtime(language)
-            .iter()
-            .filter(|choice| choice.model.id != model.id)
-            .filter_map(|choice| benchmark(choice.model))
-            .all(|other| record.comparable(&other))
-}
-
-const PARAKEET_V3_LANGUAGES: &[&str] = &[
-    "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt", "mt",
-    "pl", "pt", "ro", "ru", "sk", "sl", "es", "sv", "uk",
-];
-const QWEN_LANGUAGES: &[&str] = &[
-    "zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it", "ko", "ru", "th", "vi", "ja",
-    "tr", "hi", "ms", "nl", "sv", "da", "fi", "pl", "cs", "fil", "fa", "el", "ro", "hu", "mk",
-];
-const COHERE_LANGUAGES: &[&str] = &[
-    "en", "fr", "de", "es", "it", "pt", "nl", "pl", "el", "ar", "ja", "zh", "vi", "ko",
-];
-
-const PARAKEET_V2_ARTIFACT: GgufArtifact = GgufArtifact {
-    filename: "parakeet-tdt-0.6b-v2-Q8_0.gguf",
-    revision: "07cee0616125a08ef619729bb47f40ef747e4bc4",
-    repository: "handy-computer/parakeet-tdt-0.6b-v2-gguf",
-    bytes: 729_574_912,
-    sha256: "f0d0e99cebb6d3b83f1f7069b82b5d3c2e39a54545b0da039cb4bafd9c4e5caa",
-    architecture: "parakeet",
-    variant: "tdt-0.6b-v2",
-};
-const PARAKEET_UNIFIED_ENGLISH_ARTIFACT: GgufArtifact = GgufArtifact {
-    filename: "parakeet-unified-en-0.6b-Q8_0.gguf",
-    revision: "7e948f21b7bdbac698d3318db9d350f1096f3b6c",
-    repository: "handy-computer/parakeet-unified-en-0.6b-gguf",
-    bytes: 731_357_568,
-    sha256: "4b50b6dd862bf6e346929aaf4f5eaacec003bfa3f56462d6c874b41ef2f38795",
-    architecture: "parakeet",
-    variant: "unified-en-0.6b",
-};
-const PARAKEET_V3_ARTIFACT: GgufArtifact = GgufArtifact {
-    filename: "parakeet-tdt-0.6b-v3-Q8_0.gguf",
-    revision: "85ac09ea12fc4b1112fa76810059364bc6adc9de",
-    repository: "handy-computer/parakeet-tdt-0.6b-v3-gguf",
-    bytes: 739_508_576,
-    sha256: "5859f77944efcd8eafa23a6350731960b2b55b2203df51f319665c807d802cc7",
-    architecture: "parakeet",
-    variant: "tdt-0.6b-v3",
-};
-const WHISPER_ARTIFACT: GgufArtifact = GgufArtifact {
-    filename: "whisper-large-v3-turbo-Q8_0.gguf",
-    revision: "d222c9f621c1128299248f2ded4d8a1820519780",
-    repository: "handy-computer/whisper-large-v3-turbo-gguf",
-    bytes: 886_381_824,
-    sha256: "d5e65f2b0828802ae2c231673d31982cebe3a778c95d9494a9f3efee6bd17448",
-    architecture: "whisper",
-    variant: "whisper-large-v3-turbo",
-};
-const QWEN_ARTIFACT: GgufArtifact = GgufArtifact {
-    filename: "Qwen3-ASR-0.6B-Q8_0.gguf",
-    revision: "e4e16599b900eb0cb36e524514756bb92eb092b7",
-    repository: "handy-computer/Qwen3-ASR-0.6B-gguf",
-    bytes: 850_423_456,
-    sha256: "f081b2d5e23bd669d92cc331d722a8a0681943b8e6f34b48996fd5c319b5acd8",
-    architecture: "qwen3_asr",
-    variant: "qwen3-asr-0.6b",
-};
-// Mohammed Aly's Qwen3-ASR 1.7B fine-tune for Egyptian Arabic and
-// Arabic/English code-switching (Apache-2.0), from mohammedaly22/QwenCleo-ASR
-// at 50f6b901. Converted with transcribe.cpp 7045d1c's Qwen3-ASR converter,
-// with the fine-tune's attribution in `general.*`, and quantized to Q8_0;
-// rebuilding it that way reproduces this file byte for byte.
-const QWENCLEO_ARTIFACT: GgufArtifact = GgufArtifact {
-    filename: "QwenCleo-ASR-1.7B-Q8_0.gguf",
-    revision: "08c66976a0496e1e3f1a88965eea123631e634fa",
-    repository: "reomar15/QwenCleo-ASR-transcribe-cpp-GGUF",
-    bytes: 2_185_030_816,
-    sha256: "43bae9d5d7a26684b4a0faf1abc6e872b5825cc9147dbb7200da9ff4c5d12f87",
-    architecture: "qwen3_asr",
-    variant: "qwen3-asr-1.7b",
-};
-const SENSEVOICE_ARTIFACT: GgufArtifact = GgufArtifact {
-    filename: "SenseVoiceSmall-Q8_0.gguf",
-    revision: "4a08b8e900b38a977e32eb08d5d0697d6e72ba04",
-    repository: "handy-computer/SenseVoiceSmall-gguf",
-    bytes: 252_684_608,
-    sha256: "6c759ee4c9748c9b3f7a5a60ca74f0f7e685fb9d45d1378fce7cfd62f59adf29",
-    architecture: "sensevoice",
-    variant: "sensevoice-small",
-};
-const COHERE_ARTIFACT: GgufArtifact = GgufArtifact {
-    filename: "cohere-transcribe-03-2026-Q8_0.gguf",
-    revision: "dfa4adebb64f3076b7b6b90b721275cc069cb421",
-    repository: "handy-computer/cohere-transcribe-03-2026-gguf",
-    bytes: 2_410_655_232,
-    sha256: "931916663432fd895423a4291a8400221802b288967ca2d435fc5e3141c9e71e",
-    architecture: "cohere_asr",
-    variant: "cohere-transcribe-03-2026",
-};
-// Conway Research's Parakeet TDT v3 fine-tunes (CC-BY-4.0), converted to
-// Q8_0 with transcribe.cpp's Parakeet converter; each repository holds the
-// recipe.
-const UNDERDOG_BARK_3_PRO_ARTIFACT: GgufArtifact = GgufArtifact {
-    filename: "underdog-bark-3.0-pro-Q8_0.gguf",
-    revision: "5c10586263806666c0a8b4905a3346a7c679803e",
-    repository: "joshthomasdev/underdog-bark-3.0-pro-gguf",
-    bytes: 739_508_480,
-    sha256: "472d151cc1546bd30629c4c25df3a8e555e8990845843ddafe76800c640e9865",
-    architecture: "parakeet",
-    variant: "tdt-0.6b-bark-3.0-pro",
-};
-const UNDERDOG_BARK_3_CLEAN_ARTIFACT: GgufArtifact = GgufArtifact {
-    filename: "underdog-bark-3.0-clean-Q8_0.gguf",
-    revision: "868701fd53d62c59d759ed1d79e095118f3fa7b9",
-    repository: "joshthomasdev/underdog-bark-3.0-clean-gguf",
-    bytes: 739_508_480,
-    sha256: "42ec2f70a3d14842e322391baf5186b2829f271cc7e396aed25580135ae46fae",
-    architecture: "parakeet",
-    variant: "tdt-0.6b-bark-3.0-clean",
-};
 /// Silero VAD v6.2. Dictation and meetings skip audio it finds no speech in,
 /// because models hallucinate closing phrases such as "thank you" on silence
 /// and room noise. It downloads with every transcription model.
@@ -580,9 +375,6 @@ pub const MODELS: &[ModelDefinition] = &[
         name: "Parakeet Unified English",
         realtime: "~163x",
         word_error_rate: Some(1.60),
-        quality_context: "English benchmark",
-        coverage: "English",
-        timestamps: "Token timestamps",
         streams: true,
         runtime: ModelRuntime::Gguf(&PARAKEET_UNIFIED_ENGLISH_ARTIFACT),
         languages: &["en"],
@@ -594,9 +386,6 @@ pub const MODELS: &[ModelDefinition] = &[
         name: "Parakeet v2",
         realtime: "~55x",
         word_error_rate: Some(1.69),
-        quality_context: "English benchmark",
-        coverage: "English",
-        timestamps: "Token timestamps",
         streams: false,
         runtime: ModelRuntime::Gguf(&PARAKEET_V2_ARTIFACT),
         languages: &["en"],
@@ -608,9 +397,6 @@ pub const MODELS: &[ModelDefinition] = &[
         name: "Parakeet v3",
         realtime: "~33x",
         word_error_rate: Some(1.94),
-        quality_context: "English benchmark",
-        coverage: "25 languages",
-        timestamps: "Token timestamps",
         streams: false,
         runtime: ModelRuntime::Gguf(&PARAKEET_V3_ARTIFACT),
         languages: PARAKEET_V3_LANGUAGES,
@@ -623,9 +409,6 @@ pub const MODELS: &[ModelDefinition] = &[
         name: "Whisper large-v3-turbo",
         realtime: "~19x",
         word_error_rate: Some(2.01),
-        quality_context: "English benchmark",
-        coverage: "100 languages",
-        timestamps: "Segment timestamps",
         streams: false,
         runtime: ModelRuntime::Gguf(&WHISPER_ARTIFACT),
         languages: &["*"],
@@ -637,9 +420,6 @@ pub const MODELS: &[ModelDefinition] = &[
         name: "Qwen3-ASR 0.6B",
         realtime: "~16x",
         word_error_rate: Some(7.64),
-        quality_context: "Mandarin benchmark",
-        coverage: "30 languages",
-        timestamps: "No timestamps",
         streams: false,
         runtime: ModelRuntime::Gguf(&QWEN_ARTIFACT),
         languages: QWEN_LANGUAGES,
@@ -653,12 +433,24 @@ pub const MODELS: &[ModelDefinition] = &[
         realtime: "~9x",
         // The author's own 3,699-utterance evaluation, not a public test set.
         word_error_rate: Some(19.85),
-        quality_context: "Author's Egyptian Arabic test",
-        coverage: "Egyptian Arabic, with English terms",
-        timestamps: "No timestamps",
         streams: false,
         runtime: ModelRuntime::Gguf(&QWENCLEO_ARTIFACT),
         languages: &["ar"],
+        accepts_language_hint: true,
+        supports_language_detection: false,
+    },
+    ModelDefinition {
+        id: TranscriptionModelId::IvritWhisperLargeV3Turbo,
+        name: "ivrit.ai Whisper large-v3-turbo",
+        // The same architecture and size as Whisper large-v3-turbo; on apollo
+        // it ran a 9.8 s Hebrew clip as fast as the stock model (38x and 36x).
+        realtime: "~19x",
+        word_error_rate: Some(18.45),
+        streams: false,
+        runtime: ModelRuntime::Gguf(&IVRIT_WHISPER_ARTIFACT),
+        // ivrit.ai: the fine-tune lost language detection and translation, so
+        // it always runs with the Hebrew hint.
+        languages: &["he"],
         accepts_language_hint: true,
         supports_language_detection: false,
     },
@@ -667,9 +459,6 @@ pub const MODELS: &[ModelDefinition] = &[
         name: "SenseVoice Small",
         realtime: "~72x",
         word_error_rate: Some(10.11),
-        quality_context: "Mandarin benchmark",
-        coverage: "5 languages",
-        timestamps: "No timestamps",
         streams: false,
         runtime: ModelRuntime::Gguf(&SENSEVOICE_ARTIFACT),
         languages: &["zh", "yue", "en", "ja", "ko"],
@@ -681,9 +470,6 @@ pub const MODELS: &[ModelDefinition] = &[
         name: "Cohere Transcribe",
         realtime: "73x",
         word_error_rate: Some(1.27),
-        quality_context: "English benchmark",
-        coverage: "14 languages",
-        timestamps: "No timestamps",
         streams: false,
         runtime: ModelRuntime::Gguf(&COHERE_ARTIFACT),
         languages: COHERE_LANGUAGES,
@@ -695,9 +481,6 @@ pub const MODELS: &[ModelDefinition] = &[
         name: "Underdog Bark 3.0 Pro",
         realtime: "~33x",
         word_error_rate: Some(1.38),
-        quality_context: "English benchmark",
-        coverage: "English",
-        timestamps: "Token timestamps",
         streams: false,
         runtime: ModelRuntime::Gguf(&UNDERDOG_BARK_3_PRO_ARTIFACT),
         languages: &["en"],
@@ -710,12 +493,61 @@ pub const MODELS: &[ModelDefinition] = &[
         name: "Underdog Bark 3.0 Clean",
         realtime: "~33x",
         word_error_rate: Some(1.71),
-        quality_context: "English benchmark",
-        coverage: "English, without filler words",
-        timestamps: "Token timestamps",
         streams: false,
         runtime: ModelRuntime::Gguf(&UNDERDOG_BARK_3_CLEAN_ARTIFACT),
         languages: &["en"],
+        accepts_language_hint: false,
+        supports_language_detection: false,
+    },
+    ModelDefinition {
+        id: TranscriptionModelId::ParakeetUltra,
+        name: "Parakeet Ultra",
+        // As fast as Parakeet v3 on apollo's Vulkan GPU (191x against 211x
+        // on a FLEURS English clip), so it keeps v3's figure.
+        realtime: "~33x",
+        // LibriSpeech test-clean, transcribe.cpp's published conversion
+        // benchmark (`model_benchmarks`); not measured in Hex.
+        word_error_rate: Some(1.80),
+        streams: false,
+        runtime: ModelRuntime::Gguf(&PARAKEET_ULTRA_ARTIFACT),
+        languages: PARAKEET_V3_LANGUAGES,
+        // Like v3, its base: it detects the language from the audio and has
+        // no language input.
+        accepts_language_hint: false,
+        supports_language_detection: false,
+    },
+    ModelDefinition {
+        id: TranscriptionModelId::Nemotron35Asr,
+        name: "Nemotron 3.5 ASR",
+        // On apollo's Vulkan GPU it ran 0.55 to 0.97 times as fast as
+        // Parakeet v3 (17.9 s and 54.6 s German clips), against v3's ~33x.
+        realtime: "~25x",
+        // LibriSpeech test-clean, Hex's run (`model_benchmarks`). On the same
+        // runs Parakeet v3 made fewer errors: 1.95% here, and on FLEURS 4.88%
+        // English and 5.17% German against 7.91% and 10.39% (8.77% and
+        // 10.46% with Auto). It is here to stream with the language set.
+        word_error_rate: Some(3.05),
+        streams: true,
+        runtime: ModelRuntime::Gguf(&NEMOTRON_3_5_ASR_ARTIFACT),
+        languages: NEMOTRON_3_5_LANGUAGES,
+        // Its prompt takes the language (`runtime_language`), and Auto leaves
+        // it to the model.
+        accepts_language_hint: true,
+        supports_language_detection: true,
+    },
+    ModelDefinition {
+        id: TranscriptionModelId::GigaAmV3,
+        name: "GigaAM v3",
+        // On apollo's Vulkan GPU it ran 1.2 to 1.4 times as fast as Parakeet
+        // v3 (the FLEURS Russian test split, and a 10 s clip of it).
+        realtime: "~40x",
+        // FLEURS Russian test, Hex's run (`model_benchmarks`): Parakeet v3
+        // scored 6.52% on the same run and Whisper large-v3-turbo 5.36%.
+        word_error_rate: Some(5.37),
+        streams: false,
+        runtime: ModelRuntime::Gguf(&GIGAAM_V3_E2E_RNNT_ARTIFACT),
+        languages: &["ru"],
+        // Russian only: it has no language input.
         accepts_language_hint: false,
         supports_language_detection: false,
     },
@@ -724,9 +556,6 @@ pub const MODELS: &[ModelDefinition] = &[
         name: "Apple Speech",
         realtime: "On device",
         word_error_rate: None,
-        quality_context: "Apple managed",
-        coverage: "System locales",
-        timestamps: "Segment timestamps",
         streams: false,
         runtime: ModelRuntime::AppleSpeech,
         languages: &["*"],
@@ -737,69 +566,33 @@ pub const MODELS: &[ModelDefinition] = &[
 
 pub const AUTO_LANGUAGE: &str = "auto";
 
-pub const LANGUAGES: &[(&str, &str)] = &[
-    (AUTO_LANGUAGE, "Auto"),
-    ("en", "English"),
-    ("zh", "Mandarin Chinese"),
-    ("yue", "Cantonese"),
-    ("ja", "Japanese"),
-    ("ko", "Korean"),
-    ("es", "Spanish"),
-    ("fr", "French"),
-    ("de", "German"),
-    ("pt", "Portuguese"),
-    ("it", "Italian"),
-    ("ar", "Arabic"),
-    ("hi", "Hindi"),
-    ("bn", "Bangla"),
-    ("vi", "Vietnamese"),
-    ("ru", "Russian"),
-    ("uk", "Ukrainian"),
-    ("nl", "Dutch"),
-    ("pl", "Polish"),
-    ("tr", "Turkish"),
-    ("sv", "Swedish"),
-    ("da", "Danish"),
-    ("fi", "Finnish"),
-    ("cs", "Czech"),
-    ("el", "Greek"),
-    ("ro", "Romanian"),
-    ("hu", "Hungarian"),
-    ("id", "Indonesian"),
-    ("ms", "Malay"),
-    ("th", "Thai"),
-    ("fa", "Persian"),
-    ("bg", "Bulgarian"),
-    ("hr", "Croatian"),
-    ("et", "Estonian"),
-    ("lv", "Latvian"),
-    ("lt", "Lithuanian"),
-    ("mt", "Maltese"),
-    ("sk", "Slovak"),
-    ("sl", "Slovenian"),
-    ("mk", "Macedonian"),
-    ("fil", "Filipino"),
-];
-
 pub fn definition(id: TranscriptionModelId) -> &'static ModelDefinition {
+    if let TranscriptionModelId::Custom(id) = id {
+        return super::custom_models::definition(id);
+    }
     MODELS
         .iter()
         .find(|model| model.id == id)
         .expect("every transcription model id has a definition")
 }
 
-pub fn language_name(code: &str) -> &str {
-    LANGUAGES
+/// Every catalog model, then the imports while their Labs toggle is on.
+pub fn all_models() -> Vec<&'static ModelDefinition> {
+    MODELS
         .iter()
-        .find_map(|(candidate, name)| (*candidate == code).then_some(*name))
-        .unwrap_or(code)
+        .chain(
+            super::custom_models::imported()
+                .into_iter()
+                .map(|import| import.definition),
+        )
+        .collect()
 }
 
 pub(crate) fn choices_for_runtime(language: &str) -> Vec<ModelChoice> {
     use Recommendation::{Fastest, MostAccurate, Recommended, Vocabulary};
     use TranscriptionModelId::{
-        CohereTranscribe, ParakeetUnifiedEnglish, ParakeetV3, Qwen3Asr06B, SenseVoiceSmall,
-        WhisperLargeV3Turbo,
+        CohereTranscribe, GigaAmV3, IvritWhisperLargeV3Turbo, ParakeetUnifiedEnglish, ParakeetV3,
+        Qwen3Asr06B, SenseVoiceSmall, WhisperLargeV3Turbo,
     };
     let choices: &[(TranscriptionModelId, Recommendation)] = match language {
         AUTO_LANGUAGE => &[(WhisperLargeV3Turbo, Recommended), (Qwen3Asr06B, Fastest)],
@@ -832,6 +625,14 @@ pub(crate) fn choices_for_runtime(language: &str) -> Vec<ModelChoice> {
             (CohereTranscribe, MostAccurate),
         ],
         "tr" | "ms" | "fil" | "fa" | "mk" => &[(WhisperLargeV3Turbo, Recommended)],
+        // FLEURS Hebrew test: 18.45% WER against stock Whisper's 29.69%.
+        "he" => &[
+            (IvritWhisperLargeV3Turbo, Recommended),
+            (WhisperLargeV3Turbo, Vocabulary),
+        ],
+        // FLEURS Russian test: 5.37% WER against Parakeet v3's 6.52%, and
+        // Whisper turbo's 5.36% at a fifth of its speed (Hex's run).
+        "ru" => &[(GigaAmV3, Recommended), (WhisperLargeV3Turbo, Vocabulary)],
         "vi" => &[
             (Qwen3Asr06B, Recommended),
             (CohereTranscribe, MostAccurate),
@@ -868,6 +669,10 @@ pub(crate) fn picker_models(
         .filter(|model| recommended.iter().all(|choice| choice.model.id != model.id));
     let (supporting, switching): (Vec<_>, Vec<_>) =
         others.partition(|model| model.supports_language(language));
+    // Imports follow, ready or not, so one that can't run can still be removed.
+    let imported = super::custom_models::imported()
+        .into_iter()
+        .map(|import| import.definition);
     recommended
         .iter()
         .map(|choice| (choice.model, Some(choice.recommendation)))
@@ -875,6 +680,7 @@ pub(crate) fn picker_models(
             supporting
                 .into_iter()
                 .chain(switching)
+                .chain(imported)
                 .map(|model| (model, None)),
         )
         .collect()
@@ -895,7 +701,29 @@ const WHISPER_LANGUAGES: &[&str] = &[
 /// Whether `language` is a code Hex knows: one Settings lists, or one of
 /// Whisper's, which only models that accept any language support.
 pub fn is_known_language(language: &str) -> bool {
-    LANGUAGES.iter().any(|(code, _)| *code == language) || WHISPER_LANGUAGES.contains(&language)
+    known_language(language).is_some()
+}
+
+/// `language` as Hex's own `'static` code, when Hex knows it.
+pub(crate) fn known_language(language: &str) -> Option<&'static str> {
+    LANGUAGES
+        .iter()
+        .map(|(code, _)| *code)
+        .chain(WHISPER_LANGUAGES.iter().copied())
+        .find(|code| *code == language)
+}
+
+/// Whether a saved selection stays saved: one `validate` accepts, or an
+/// import with a known language, kept while it is missing, changed, or off
+/// so the choice survives until it is fixed ([`super::custom_models::runnable`]).
+pub fn validate_saved(selection: &TranscriptionSelection) -> Result<()> {
+    if selection.model.is_labs_gated() {
+        if !is_known_language(&selection.language) {
+            bail!("unsupported transcription language: {}", selection.language);
+        }
+        return Ok(());
+    }
+    validate(selection).map(drop)
 }
 
 pub fn validate(selection: &TranscriptionSelection) -> Result<&'static ModelDefinition> {
@@ -929,6 +757,11 @@ thread_local! {
     static TEST_MODELS_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+pub(crate) fn set_test_models_dir(directory: Option<PathBuf>) {
+    TEST_MODELS_DIR.with(|models| *models.borrow_mut() = directory);
+}
+
 pub fn max_audio_chunk_samples(architecture: &str, max_audio_ms: i64) -> Option<usize> {
     // Cohere's encoder capacity is not its recommended transcription window.
     // The pinned model's reference processor chunks long audio at 35 seconds.
@@ -947,7 +780,27 @@ pub fn model_path(model: &ModelDefinition) -> Result<PathBuf> {
     let ModelRuntime::Gguf(artifact) = model.runtime else {
         bail!("{} is managed by macOS and has no model path", model.name);
     };
-    Ok(models_dir()?.join(artifact.filename))
+    let managed = models_dir()?.join(artifact.filename);
+    // A catalog model another app downloaded (one already in use, or an
+    // exact match the last scan found), used where it is.
+    if !model.id.is_custom()
+        && !managed.exists()
+        && let Some(found) = super::found_models::catalog_candidate(model)
+    {
+        return Ok(found);
+    }
+    Ok(managed)
+}
+
+/// Whether `model` runs from a file another app downloaded (Delete forgets it).
+pub fn is_in_place(model: &ModelDefinition) -> bool {
+    !model.id.is_custom() && model_path(model).is_ok_and(|path| in_place(&path) && path.is_file())
+}
+
+/// Whether `path` is outside Hex's own models folder: a found file Hex
+/// reads in place and never writes, moves, or deletes.
+fn in_place(path: &Path) -> bool {
+    models_dir().is_ok_and(|directory| !path.starts_with(directory))
 }
 
 pub fn is_installed(model: &ModelDefinition, language: &str) -> bool {
@@ -965,15 +818,28 @@ pub fn is_installed(model: &ModelDefinition, language: &str) -> bool {
 }
 
 pub fn is_verified(model: &ModelDefinition) -> bool {
+    if let TranscriptionModelId::Custom(id) = model.id {
+        return super::custom_models::status(id) == super::custom_models::Status::Ready;
+    }
     let Ok(path) = model_path(model) else {
         return false;
     };
+    if in_place(&path) {
+        return super::found_models::catalog_verified(model);
+    }
     verification_receipt_matches(&path, model)
 }
 
 pub fn verify_installed(model: &ModelDefinition, canceled: &AtomicBool) -> Result<PathBuf> {
     check_canceled(canceled)?;
+    if let TranscriptionModelId::Custom(id) = model.id {
+        return super::custom_models::verify(id, canceled);
+    }
     let path = model_path(model)?;
+    // Receipts for found files live with Hex, never beside the file.
+    if in_place(&path) {
+        return super::found_models::adopt_catalog(model, &path, canceled);
+    }
     verify_installed_at(&path, model, canceled)?;
     Ok(path)
 }
@@ -981,6 +847,9 @@ pub fn verify_installed(model: &ModelDefinition, canceled: &AtomicBool) -> Resul
 fn verify_installed_at(path: &Path, model: &ModelDefinition, canceled: &AtomicBool) -> Result<()> {
     check_canceled(canceled)?;
     if !path.is_file() {
+        if model.id.is_custom() {
+            bail!("{} is missing. Import it again.", model.name);
+        }
         bail!(
             "{} is no longer installed. Open Settings to download it.",
             model.name
@@ -997,13 +866,21 @@ fn verify_installed_at(path: &Path, model: &ModelDefinition, canceled: &AtomicBo
 /// Deletes a downloaded model with its verification receipt and any partial
 /// download. Refuses instead of waiting while a download owns the directory.
 pub fn remove_installed(model: &ModelDefinition) -> Result<()> {
+    if let TranscriptionModelId::Custom(id) = model.id {
+        return super::custom_models::remove(id);
+    }
     if !matches!(model.runtime, ModelRuntime::Gguf(_)) {
         bail!("{} is managed by macOS and cannot be deleted", model.name);
     }
-    remove_installed_at(&model_path(model)?)
+    let path = model_path(model)?;
+    // A found file is only forgotten.
+    if in_place(&path) {
+        return super::found_models::forget_catalog(model);
+    }
+    remove_installed_at(&path)
 }
 
-fn remove_installed_at(path: &Path) -> Result<()> {
+pub(crate) fn remove_installed_at(path: &Path) -> Result<()> {
     let directory = path.parent().expect("model directory");
     if !directory.is_dir() {
         return Ok(());
@@ -1149,7 +1026,16 @@ pub fn download_with_stage_progress(
     let ModelRuntime::Gguf(artifact) = model.runtime else {
         bail!("{} is installed and managed by macOS", model.name);
     };
-    let path = download_artifact(artifact, model.name, canceled, downloaded_bytes, stage)?;
+    // An import has nothing to download: Hex checks its own copy. A catalog
+    // model another app already downloaded is checked and used where it is.
+    let path = if model.id.is_custom() || model_path(model).is_ok_and(|path| in_place(&path)) {
+        ModelPreparationStage::Verifying.store(stage);
+        let path = verify_installed(model, canceled)?;
+        downloaded_bytes.store(artifact.bytes, Ordering::Relaxed);
+        path
+    } else {
+        download_artifact(artifact, model.name, canceled, downloaded_bytes, stage)?
+    };
     // In the background, so an installed model activates at once even
     // offline. Until the detector lands, dictation and meetings keep their
     // level-only silence handling.
@@ -1244,56 +1130,26 @@ fn download_artifact(
         }
     }
     ModelPreparationStage::Downloading.store(stage);
-    let mut child = crate::desktop::background_process::command("curl")
-        .args([
-            "--fail",
-            "--location",
-            "--retry",
-            "3",
-            "--connect-timeout",
-            "15",
-            "--speed-limit",
-            "1024",
-            "--speed-time",
-            "60",
-            "--continue-at",
-            "-",
-            "--silent",
-            "--show-error",
-            "--output",
-        ])
-        .arg(&partial)
-        .arg(artifact.download_url())
-        .stderr(Stdio::piped())
-        .spawn()
-        .wrap_err("could not start model download")?;
-    let status = loop {
-        downloaded_bytes.store(
-            fs::metadata(&partial).map_or(0, |metadata| metadata.len()),
-            Ordering::Relaxed,
-        );
-        if canceled.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("model download canceled");
-        }
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        thread::sleep(Duration::from_millis(100));
-    };
-    if !status.success() {
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            pipe.read_to_string(&mut stderr)?;
-        }
+    // In-process HTTPS with the system's proxy and trusted roots (`net`), so
+    // managed networks with a proxy or TLS inspection work (#894).
+    let url = artifact.download_url();
+    let fetched = crate::net::download(
+        &crate::net::Download {
+            url: &url,
+            user_agent: &format!("hex/{}", crate::VERSION),
+            size: Some(artifact.bytes),
+            canceled: Some(canceled),
+        },
+        &partial,
+        |bytes| downloaded_bytes.store(bytes, Ordering::Relaxed),
+    );
+    if let Err(error) = fetched {
+        check_canceled(canceled)?;
+        // The first line is the reason onboarding and Settings show.
         bail!(
-            "Could not download the model from huggingface.co or its download CDN. \
-             Check your connection, then retry in Settings. On a managed network, \
-             ask IT to allow Hugging Face model downloads. \
-             The app download uses a separate host. Download progress is kept for retry. \
-             Details ({status}): {}",
-            stderr.trim()
+            "{error}\n\nCheck your connection, then retry, or choose a model file. \
+             On a managed network, ask IT to allow downloads from huggingface.co and \
+             its download CDN. Download progress is kept for retry."
         );
     }
     check_canceled(canceled)?;
@@ -1492,6 +1348,91 @@ mod tests {
     }
 
     #[test]
+    fn parakeet_ultra_is_offered_only_with_its_lab_and_a_saved_choice_survives() {
+        let ultra = definition(TranscriptionModelId::ParakeetUltra);
+        assert_eq!(ultra.available(), crate::labs::parakeet_ultra());
+        assert!(!ultra.streams && !ultra.accepts_language_hint);
+        assert_eq!(ultra.languages, PARAKEET_V3_LANGUAGES);
+        for language in [AUTO_LANGUAGE, "en", "de"] {
+            assert!(
+                choices_for_runtime(language)
+                    .iter()
+                    .all(|choice| choice.model.id != ultra.id),
+                "Ultra is never recommended ({language})"
+            );
+        }
+        let saved = TranscriptionSelection {
+            model: ultra.id,
+            language: "de".into(),
+        };
+        assert!(validate_saved(&saved).is_ok());
+        if !crate::labs::parakeet_ultra() {
+            assert!(validate(&saved).is_err());
+            assert_eq!(
+                super::super::custom_models::runnable(&saved),
+                super::super::custom_models::fallback()
+            );
+        }
+        let mut settings = crate::app_settings::AppSettings::default();
+        assert!(
+            crate::labs::Feature::ParakeetUltra
+                .off_refusal(&settings)
+                .is_none()
+        );
+        settings.transcription = saved;
+        assert!(
+            crate::labs::Feature::ParakeetUltra
+                .off_refusal(&settings)
+                .is_some()
+        );
+        assert!(
+            crate::labs::Feature::BenchmarkDetails
+                .off_refusal(&settings)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hebrew_recommends_the_ivrit_fine_tune_with_its_hint() {
+        use Recommendation::{Recommended, Vocabulary};
+        use TranscriptionModelId::{IvritWhisperLargeV3Turbo, WhisperLargeV3Turbo};
+        let hebrew: Vec<_> = choices_for_runtime("he")
+            .into_iter()
+            .map(|choice| (choice.model.id, choice.recommendation))
+            .collect();
+        assert_eq!(
+            hebrew,
+            [
+                (IvritWhisperLargeV3Turbo, Recommended),
+                (WhisperLargeV3Turbo, Vocabulary)
+            ]
+        );
+        let ivrit = definition(IvritWhisperLargeV3Turbo);
+        assert_eq!(ivrit.language_choices(), ["he"]);
+        assert_eq!(ivrit.runtime_language_hint("he"), Some("he"));
+        assert!(!ivrit.supports_language(AUTO_LANGUAGE));
+        assert_eq!(language_name("he"), "Hebrew");
+    }
+
+    #[test]
+    fn russian_recommends_gigaam_without_a_hint() {
+        use Recommendation::{Recommended, Vocabulary};
+        use TranscriptionModelId::{GigaAmV3, WhisperLargeV3Turbo};
+        let russian: Vec<_> = choices_for_runtime("ru")
+            .into_iter()
+            .map(|choice| (choice.model.id, choice.recommendation))
+            .collect();
+        assert_eq!(
+            russian,
+            [(GigaAmV3, Recommended), (WhisperLargeV3Turbo, Vocabulary)]
+        );
+        let gigaam = definition(GigaAmV3);
+        assert_eq!(gigaam.language_choices(), ["ru"]);
+        assert_eq!(gigaam.runtime_language_hint("ru"), None);
+        assert_eq!(gigaam.vocabulary_use(), VocabularyUse::None);
+    }
+
+    #[test]
     fn recommendations_are_language_specific() {
         let english = choices_for_runtime("en");
         assert_eq!(
@@ -1545,29 +1486,8 @@ mod tests {
     }
 
     #[test]
-    fn accuracy_is_the_inverse_of_the_word_error_rate() {
-        assert_eq!(
-            definition(TranscriptionModelId::ParakeetUnifiedEnglish)
-                .accuracy_label()
-                .as_deref(),
-            Some("98.4%")
-        );
-        assert_eq!(
-            definition(TranscriptionModelId::SenseVoiceSmall)
-                .accuracy_label()
-                .as_deref(),
-            Some("89.9%")
-        );
-        assert_eq!(
-            definition(TranscriptionModelId::AppleSpeech).accuracy_label(),
-            None
-        );
-        assert_eq!(accuracy_label(0.0), "100.0%");
-        assert_eq!(accuracy_label(112.5), "0.0%");
-    }
-
-    #[test]
     fn only_figures_on_the_same_metric_language_and_dataset_compare() {
+        use crate::transcription::model_benchmarks::ErrorMetric;
         let qwen = benchmark(definition(TranscriptionModelId::Qwen3Asr06B)).unwrap();
         let sensevoice = benchmark(definition(TranscriptionModelId::SenseVoiceSmall)).unwrap();
         assert_eq!(qwen.rate_label(), "7.57% CER");
@@ -1618,20 +1538,46 @@ mod tests {
     }
 
     #[test]
-    fn only_the_buffered_parakeet_artifact_is_marked_streaming() {
+    fn only_the_streaming_parakeet_artifacts_are_marked_streaming() {
         // transcribe.cpp advertises streaming for Parakeet's chunked-attention
-        // variants; Whisper, Qwen3-ASR, SenseVoice, Cohere, and the offline
-        // TDT checkpoints transcribe whole clips.
+        // (Unified English) and cache-aware (Nemotron 3.5) variants; Whisper,
+        // Qwen3-ASR, SenseVoice, Cohere, and the offline TDT checkpoints
+        // transcribe whole clips.
         let streaming = MODELS
             .iter()
             .filter(|model| model.streams)
-            .map(|model| model.id)
+            .map(|model| match model.runtime {
+                ModelRuntime::Gguf(artifact) => artifact.variant,
+                ModelRuntime::AppleSpeech => panic!("a streaming model has a GGUF artifact"),
+            })
             .collect::<Vec<_>>();
-        assert_eq!(streaming, [TranscriptionModelId::ParakeetUnifiedEnglish]);
-        let ModelRuntime::Gguf(artifact) = definition(streaming[0]).runtime else {
-            panic!("a streaming model has a GGUF artifact");
-        };
-        assert_eq!(artifact.variant, "unified-en-0.6b");
+        assert_eq!(
+            streaming,
+            ["unified-en-0.6b", "nemotron-3.5-asr-streaming-0.6b"]
+        );
+    }
+
+    #[test]
+    fn nemotron_takes_its_languages_as_locales_and_detects_with_auto() {
+        let nemotron = definition(TranscriptionModelId::Nemotron35Asr);
+        assert_eq!(nemotron.runtime_language_hint("de"), Some("de-DE"));
+        assert_eq!(nemotron.runtime_language_hint("zh"), Some("zh-CN"));
+        assert_eq!(nemotron.runtime_language_hint(AUTO_LANGUAGE), None);
+        assert!(nemotron.supports_language(AUTO_LANGUAGE));
+        // Every language it offers has its locale.
+        for language in nemotron.languages {
+            assert!(
+                NEMOTRON_3_5_LOCALES
+                    .iter()
+                    .any(|(code, _)| code == language),
+                "{language}"
+            );
+        }
+        assert!(nemotron.languages.iter().all(|code| {
+            super::super::languages::LANGUAGES
+                .iter()
+                .any(|(known, _)| known == code)
+        }));
     }
 
     #[test]
@@ -1649,6 +1595,10 @@ mod tests {
             ),
             (TranscriptionModelId::Qwen3Asr06B, "qwen3_asr06_b"),
             (TranscriptionModelId::QwenCleoAsr17B, "qwencleo_asr_1_7b"),
+            (
+                TranscriptionModelId::IvritWhisperLargeV3Turbo,
+                "ivrit_whisper_large_v3_turbo",
+            ),
             (TranscriptionModelId::SenseVoiceSmall, "sense_voice_small"),
             (TranscriptionModelId::CohereTranscribe, "cohere_transcribe"),
             (
@@ -1659,6 +1609,9 @@ mod tests {
                 TranscriptionModelId::UnderdogBark3Clean,
                 "underdog_bark_3_clean",
             ),
+            (TranscriptionModelId::ParakeetUltra, "parakeet_ultra"),
+            (TranscriptionModelId::Nemotron35Asr, "nemotron_3_5_asr"),
+            (TranscriptionModelId::GigaAmV3, "gigaam_v3"),
             (TranscriptionModelId::AppleSpeech, "apple_speech"),
         ] {
             assert_eq!(id.as_str(), name);
@@ -1983,7 +1936,12 @@ mod tests {
         };
         assert_eq!(
             by(VocabularyUse::Prompt),
-            [WhisperLargeV3Turbo, Qwen3Asr06B, QwenCleoAsr17B]
+            [
+                WhisperLargeV3Turbo,
+                Qwen3Asr06B,
+                QwenCleoAsr17B,
+                IvritWhisperLargeV3Turbo
+            ]
         );
         assert_eq!(
             by(VocabularyUse::Bias),
@@ -1993,6 +1951,8 @@ mod tests {
                 ParakeetV3,
                 UnderdogBark3Pro,
                 UnderdogBark3Clean,
+                ParakeetUltra,
+                Nemotron35Asr,
             ]
         );
     }

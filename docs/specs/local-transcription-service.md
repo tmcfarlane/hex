@@ -175,11 +175,17 @@ export type ModelId =
   | "whisper_large_v3_turbo"
   | "qwen3_asr06_b"
   | "qwencleo_asr_1_7b"
+  | "ivrit_whisper_large_v3_turbo"
   | "sense_voice_small"
   | "cohere_transcribe"
   | "underdog_bark_3_pro"
   | "underdog_bark_3_clean"
-  | "apple_speech";
+  | "parakeet_ultra"
+  | "nemotron_3_5_asr"
+  | "gigaam_v3"
+  | "apple_speech"
+  // An imported or found model, listed while it is ready.
+  | `custom-${string}`;
 
 export interface ModelInfo {
   id: ModelId;
@@ -190,6 +196,9 @@ export interface ModelInfo {
   downloadBytes: number | null;
   languages: readonly string[];
   supportsLanguageDetection: boolean;
+  // download | hex | imported | found: owner/name@abcdef1 (another app's
+  // Hugging Face download, used where it is). Older hosts omit it.
+  source?: string;
 }
 
 export type ModelProgress =

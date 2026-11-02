@@ -48,6 +48,8 @@ pub enum PermissionAction {
     RequestMicrophone,
     /// Everything else is turned on in System Settings, with the guide.
     ShowGuide(PermissionKind),
+    /// Clear stale TCC entries for Hex and reopen the prompt and guide.
+    ResetAndPrompt(PermissionKind),
     /// Granted, waiting for Hex to restart.
     Restart,
 }
@@ -141,6 +143,9 @@ pub enum ItemStatus {
     Todo,
     /// Asked; macOS's prompt or System Settings is up. The button reopens it.
     Waiting,
+    /// Returned from System Settings still untrusted: offer to clear stale
+    /// permission entries and ask again.
+    Stale,
     /// Refused once: only System Settings can turn it on.
     Denied,
     /// Switched on; macOS applies it once Hex restarts.
@@ -185,7 +190,6 @@ pub enum Practice {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Input {
     Continue,
-    Back,
     /// "Skip" on the practice step.
     Skip,
     Grant(SetupItem),
@@ -207,6 +211,9 @@ pub enum Effect {
     /// Open the Privacy pane with the guide beside it: drag Hex into the
     /// list, or (for a refused microphone) switch it on.
     ShowGuide(PermissionKind),
+    /// Clear stale TCC entries for this permission and reopen the prompt and
+    /// guide.
+    ResetPermission(PermissionKind),
     DownloadModel,
     /// Every permission just turned on: move to the next step after a beat,
     /// so the last check is seen.
@@ -229,9 +236,6 @@ pub struct Row {
 #[derive(Clone, Debug, PartialEq)]
 pub struct View {
     pub step: Step,
-    /// Position among the dotted steps (every step but `Done`).
-    pub index: usize,
-    pub count: usize,
     pub rows: Vec<Row>,
     /// Every setup row is ready.
     pub ready: bool,
@@ -242,7 +246,6 @@ pub struct View {
     /// outside the setup rows.
     pub show_download: bool,
     pub practice: Practice,
-    pub can_go_back: bool,
     /// The listener needs a restart Hex will not do by itself again.
     pub reopen: bool,
     /// Every permission is on, and at least one applies only after Hex
@@ -261,12 +264,15 @@ pub struct Flow {
     practice_step: bool,
     /// Microphone, then Accessibility.
     asked: [bool; 2],
+    /// Accessibility stayed untrusted after returning from System Settings.
+    accessibility_stale: bool,
     /// A refused microphone's System Settings guide is up.
     microphone_guide: bool,
     practice: Practice,
-    /// The setup screen keeps its page dot once it has been needed.
-    setup_needed: bool,
     download_requested: bool,
+    /// The recommended model waits for the person: a scan for models already
+    /// on this computer is running, or found one and they choose.
+    download_held: bool,
     advance_due: bool,
     reopen: bool,
     relaunching: bool,
@@ -287,16 +293,15 @@ impl Flow {
             microphone_row: status.microphone != PermissionState::Ready,
             practice_step: practice,
             asked: [false; 2],
+            accessibility_stale: false,
             microphone_guide: false,
             practice: Practice::Waiting,
-            setup_needed: false,
             download_requested: false,
+            download_held: false,
             advance_due: false,
             reopen: false,
             relaunching: false,
         };
-        // A tour resumed at setup keeps its page dot: the person was there.
-        flow.setup_needed = !flow.setup_ready() || start == Step::Setup;
         // `status` is read fresh at launch, so a tour resumed after macOS's
         // Quit & Reopen passes a setup whose grants are now real, and one
         // resumed past setup waits there until they are.
@@ -308,17 +313,25 @@ impl Flow {
         flow
     }
 
+    /// Holds (or releases) the download the tour starts by itself, while the
+    /// person can choose a model already on this computer instead.
+    pub fn hold_download(&mut self, held: bool) {
+        self.download_held = held;
+    }
+
     pub fn step(&self) -> Step {
         self.step
+    }
+
+    /// Marks Accessibility stale once the host has seen System Settings close
+    /// or lose focus without a grant.
+    pub fn set_accessibility_stale(&mut self, stale: bool) {
+        self.accessibility_stale = stale && self.asked[1] && grantable(self.status.accessibility);
     }
 
     pub fn on(&mut self, input: Input) -> Effect {
         match input {
             Input::Continue => self.primary(),
-            Input::Back => {
-                self.step = self.back_from(self.step);
-                Effect::None
-            }
             Input::Skip if self.step == Step::TryIt => self.advance(),
             Input::Skip => Effect::None,
             Input::Grant(item) => self.grant(item),
@@ -348,27 +361,14 @@ impl Flow {
     }
 
     pub fn view(&self) -> View {
-        let dotted: Vec<Step> = Step::TOUR
-            .into_iter()
-            .filter(|step| *step != Step::Done && self.shows(*step))
-            .collect();
-        let rows = self.rows();
         View {
             step: self.step,
-            index: dotted
-                .iter()
-                .position(|step| *step == self.step)
-                .unwrap_or(dotted.len()),
-            count: dotted.len(),
-            rows,
+            rows: self.rows(),
             ready: self.setup_ready(),
             dictation_ready: self.status.ready(),
             model: self.model_status(),
             show_download: self.download_requested && !self.model_in_setup(),
             practice: self.practice,
-            can_go_back: self.step != Step::Welcome
-                && self.step != Step::Done
-                && self.back_from(self.step) != self.step,
             reopen: self.reopen,
             restart: self.restart_needed(),
         }
@@ -419,6 +419,9 @@ impl Flow {
         let was_ready = self.setup_ready();
         self.microphone_row |= status.microphone != PermissionState::Ready;
         self.status = status;
+        if !grantable(self.status.accessibility) {
+            self.accessibility_stale = false;
+        }
         self.model = model;
         if self.step == Step::Setup && !was_ready && self.setup_ready() {
             self.advance_due = true;
@@ -429,6 +432,7 @@ impl Flow {
             && model.downloading.is_none()
             && !model.failed
             && !self.download_requested
+            && !self.download_held
         {
             self.download_requested = true;
             return Effect::DownloadModel;
@@ -461,6 +465,7 @@ impl Flow {
                 status: match self.status.accessibility {
                     PermissionState::Ready => ItemStatus::Ready,
                     PermissionState::NeedsRestart => ItemStatus::Restart,
+                    _ if self.asked[1] && self.accessibility_stale => ItemStatus::Stale,
                     _ if self.asked[1] => ItemStatus::Waiting,
                     _ => ItemStatus::Todo,
                 },
@@ -480,20 +485,13 @@ impl Flow {
                 ItemStatus::Ready
                     | ItemStatus::Downloading(_)
                     | ItemStatus::Waiting
+                    | ItemStatus::Stale
                     | ItemStatus::Restart
             )
         }) {
             row.next = true;
         }
         rows
-    }
-
-    fn shows(&self, step: Step) -> bool {
-        match step {
-            Step::TryIt => self.practice_step,
-            Step::Setup => self.setup_needed || self.step == Step::Setup,
-            _ => true,
-        }
     }
 
     fn passes(&self, step: Step) -> bool {
@@ -507,17 +505,6 @@ impl Flow {
     fn forward_from(&self, mut step: Step) -> Step {
         while self.passes(step) && step != Step::Done {
             step = Step::TOUR[step.position() + 1];
-        }
-        step
-    }
-
-    fn back_from(&self, step: Step) -> Step {
-        let mut index = step.position();
-        while index > 0 {
-            index -= 1;
-            if !self.passes(Step::TOUR[index]) {
-                return Step::TOUR[index];
-            }
         }
         step
     }
@@ -563,7 +550,11 @@ impl Flow {
             }
             SetupItem::Accessibility if grantable(self.status.accessibility) => {
                 self.asked[1] = true;
-                Effect::ShowGuide(PermissionKind::Accessibility)
+                if std::mem::take(&mut self.accessibility_stale) {
+                    Effect::ResetPermission(PermissionKind::Accessibility)
+                } else {
+                    Effect::ShowGuide(PermissionKind::Accessibility)
+                }
             }
             _ => Effect::None,
         }
@@ -587,6 +578,148 @@ fn grantable(state: PermissionState) -> bool {
         state,
         PermissionState::Ready | PermissionState::NeedsRestart
     )
+}
+
+/// Bundle identifiers of older macOS Hex releases (2.3.1 and the Swift app)
+/// whose stale TCC rows can shadow or confuse grants for `anomaly.hex`.
+pub const LEGACY_MAC_BUNDLE_IDS: [&str; 3] = [
+    "com.kitlangton.hex2",
+    "com.kitlangton.Hex",
+    "com.kitlangton.Hex.debug",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TccResetOutcome {
+    Cleared,
+    NothingToClear,
+    Failed,
+}
+
+/// TCC services cleared for retired Hex bundle IDs when `kind` is missing.
+/// Both screen and system-audio lists live on the same System Settings pane, so
+/// clearing both leaves no duplicate Hex rows on either list.
+pub const fn legacy_tcc_services(kind: PermissionKind) -> &'static [&'static str] {
+    match kind {
+        PermissionKind::Accessibility => &["Accessibility"],
+        PermissionKind::SystemAudio | PermissionKind::ScreenRecording => {
+            &["ScreenCapture", "AudioCapture"]
+        }
+        PermissionKind::Microphone => &[],
+    }
+}
+
+/// TCC services reset for the running Hex bundle on `"Still grey? Fix it"`.
+/// Resets only the stuck service so a working Screen Recording grant is never
+/// cleared while fixing System Audio, or vice versa.
+pub const fn own_tcc_services(kind: PermissionKind) -> &'static [&'static str] {
+    match kind {
+        PermissionKind::Accessibility => &["Accessibility"],
+        PermissionKind::SystemAudio => &["AudioCapture"],
+        PermissionKind::ScreenRecording => &["ScreenCapture"],
+        PermissionKind::Microphone => &[],
+    }
+}
+
+/// Classifies `/usr/bin/tccutil reset` exit status and stderr. Exit code 64
+/// (`OSStatus error -10814`, no bundle on disk outside Trash) means System
+/// Settings already hides the row and there is nothing to clear.
+pub fn classify_tccutil_reset(code: Option<i32>, stderr: &str) -> TccResetOutcome {
+    if code == Some(0) {
+        TccResetOutcome::Cleared
+    } else if code == Some(64)
+        || stderr.contains("-10814")
+        || stderr.contains("No such bundle identifier")
+    {
+        TccResetOutcome::NothingToClear
+    } else {
+        TccResetOutcome::Failed
+    }
+}
+
+/// Fallback bundle identifier when `NSBundle.mainBundle.bundleIdentifier` is
+/// unavailable (such as a loose binary).
+pub fn default_mac_bundle_id(test_build: Option<&str>) -> &'static str {
+    if test_build == Some("1") {
+        "anomaly.hex.test"
+    } else {
+        "anomaly.hex"
+    }
+}
+
+/// How long after returning from System Settings an asked permission must stay
+/// untrusted before Hex offers `"Still grey? Fix it"`.
+pub const STALE_RETURN_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+/// Fallback when System Settings stayed side-by-side without taking focus (such
+/// as under a tiling window manager) while Hex remained active and untrusted.
+pub const STALE_SIDE_BY_SIDE_DELAY: std::time::Duration = std::time::Duration::from_secs(6);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SettingsFocus {
+    pub settings_open: bool,
+    pub settings_frontmost: bool,
+    pub hex_active: bool,
+}
+
+/// Tracks one asked permission across System Settings focus changes so Hex
+/// offers `"Still grey? Fix it"` only after the person went to System Settings,
+/// came back (or closed it), and Hex is still untrusted.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StalePermissionTracker {
+    asked_at: Option<std::time::Instant>,
+    saw_settings: bool,
+    returned_at: Option<std::time::Instant>,
+    stale: bool,
+}
+
+impl StalePermissionTracker {
+    pub fn note_asked(&mut self, now: std::time::Instant) {
+        self.asked_at = Some(now);
+        self.saw_settings = false;
+        self.returned_at = None;
+        self.stale = false;
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub const fn is_waiting(&self) -> bool {
+        self.asked_at.is_some()
+    }
+
+    pub fn poll(&mut self, now: std::time::Instant, untrusted: bool, focus: SettingsFocus) -> bool {
+        if !untrusted {
+            self.clear();
+            return false;
+        }
+        let Some(asked_at) = self.asked_at else {
+            return false;
+        };
+        if self.stale {
+            return true;
+        }
+        // While System Settings' window is open and Hex is inactive (including
+        // during Touch ID / password sheets or dragging from Finder), the
+        // person has not returned to Hex yet.
+        let away_in_settings =
+            focus.settings_open && (focus.settings_frontmost || !focus.hex_active);
+        if away_in_settings {
+            self.saw_settings = true;
+            self.returned_at = None;
+            return false;
+        }
+        if self.saw_settings {
+            let returned_at = *self.returned_at.get_or_insert(now);
+            if now.saturating_duration_since(returned_at) >= STALE_RETURN_DELAY {
+                self.stale = true;
+            }
+        } else if focus.hex_active
+            && now.saturating_duration_since(asked_at) >= STALE_SIDE_BY_SIDE_DELAY
+        {
+            self.stale = true;
+        }
+        self.stale
+    }
 }
 
 fn next_practice(current: Practice, observation: Observation) -> Practice {
@@ -1346,8 +1479,6 @@ mod tests {
     #[test]
     fn tour_walks_welcome_setup_try_done() {
         let mut flow = Flow::new(Step::Welcome, fresh_status(), true, true);
-        assert_eq!(flow.view().count, 3);
-        assert!(!flow.view().can_go_back);
         assert_eq!(flow.on(Input::Continue), Effect::None);
         assert_eq!(flow.step(), Step::Setup);
         assert_eq!(flow.on(Input::Continue), Effect::None, "setup is not ready");
@@ -1363,7 +1494,6 @@ mod tests {
         assert_eq!(flow.view().practice, Practice::Landed);
         flow.on(Input::Continue);
         assert_eq!(flow.step(), Step::Done);
-        assert!(!flow.view().can_go_back);
         assert_eq!(flow.on(Input::Continue), Effect::Finish);
     }
 
@@ -1400,6 +1530,32 @@ mod tests {
             flow
         };
         assert!(!installed_flow.view().show_download);
+    }
+
+    #[test]
+    fn a_held_download_waits_for_the_person() {
+        let mut flow = Flow::new(Step::Welcome, fresh_status(), true, true);
+        flow.hold_download(true);
+        assert_eq!(
+            flow.on(Input::Status(fresh_status(), ModelProgress::default())),
+            Effect::None,
+            "found models are offered first"
+        );
+        assert_eq!(flow.view().model, ItemStatus::Todo);
+        assert_eq!(
+            flow.on(Input::Grant(SetupItem::Model)),
+            Effect::DownloadModel,
+            "choosing still starts it"
+        );
+        let mut released = Flow::new(Step::Welcome, fresh_status(), true, true);
+        released.hold_download(true);
+        released.on(Input::Status(fresh_status(), ModelProgress::default()));
+        released.hold_download(false);
+        assert_eq!(
+            released.on(Input::Status(fresh_status(), ModelProgress::default())),
+            Effect::DownloadModel,
+            "nothing found: the tour downloads as before"
+        );
     }
 
     #[test]
@@ -1522,7 +1678,6 @@ mod tests {
             statuses(&flow),
             [(SetupItem::Model, ItemStatus::Todo, true)]
         );
-        assert_eq!(flow.view().count, 2, "no practice step");
         assert_eq!(
             flow.on(Input::Status(status, ModelProgress::default())),
             Effect::DownloadModel
@@ -1584,13 +1739,11 @@ mod tests {
         flow.on(Input::Status(ready_status(), installed()));
         flow.on(Input::Continue);
         assert_eq!(flow.step(), Step::Done);
-        assert!(!flow.view().can_go_back);
     }
 
     #[test]
     fn granted_permissions_skip_setup() {
         let mut flow = Flow::new(Step::Welcome, permissions_only(), true, true);
-        assert_eq!(flow.view().count, 2);
         flow.on(Input::Continue);
         assert_eq!(flow.step(), Step::TryIt);
     }
@@ -1627,10 +1780,8 @@ mod tests {
     fn resuming_past_setup_waits_on_setup_until_ready() {
         let flow = Flow::new(Step::TryIt, fresh_status(), true, true);
         assert_eq!(flow.step(), Step::Setup);
-        let mut flow = Flow::new(Step::TryIt, ready_status(), true, true);
-        assert_eq!(flow.step(), Step::TryIt);
-        flow.on(Input::Back);
-        assert_eq!(flow.step(), Step::Welcome, "a ready setup is passed");
+        let flow = Flow::new(Step::TryIt, ready_status(), true, true);
+        assert_eq!(flow.step(), Step::TryIt, "a ready setup is passed");
     }
 
     #[test]
@@ -1638,8 +1789,6 @@ mod tests {
         // macOS's Quit & Reopen after the last grant: setup is finished.
         let flow = Flow::new(Step::Setup, permissions_only(), true, true);
         assert_eq!(flow.step(), Step::TryIt, "the model can finish in practice");
-        assert_eq!(flow.view().count, 3, "setup keeps its page dot");
-        assert_eq!(flow.view().index, 2);
         let flow = Flow::new(Step::Setup, ready_status(), false, false);
         assert_eq!(flow.step(), Step::Done);
 
@@ -1838,5 +1987,161 @@ mod tests {
         record_step_at(&directory, Step::Welcome).unwrap();
         assert_eq!(saved_step_at(&directory), None, "Welcome is the default");
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tccutil_exit_codes_distinguish_cleared_absent_and_failed_bundles() {
+        assert_eq!(
+            classify_tccutil_reset(Some(0), ""),
+            TccResetOutcome::Cleared
+        );
+        assert_eq!(
+            classify_tccutil_reset(
+                Some(64),
+                "tccutil: No such bundle identifier \"com.kitlangton.hex2\": \
+                 The operation couldn’t be completed. (OSStatus error -10814.)"
+            ),
+            TccResetOutcome::NothingToClear
+        );
+        assert_eq!(
+            classify_tccutil_reset(Some(1), "OSStatus error -10814"),
+            TccResetOutcome::NothingToClear
+        );
+        assert_eq!(
+            classify_tccutil_reset(Some(1), "tccutil: Failed to reset Accessibility"),
+            TccResetOutcome::Failed
+        );
+        assert_eq!(classify_tccutil_reset(None, ""), TccResetOutcome::Failed);
+    }
+
+    #[test]
+    fn tcc_services_scope_own_resets_narrowly_and_legacy_cleanup_across_shared_pane() {
+        assert_eq!(
+            LEGACY_MAC_BUNDLE_IDS,
+            [
+                "com.kitlangton.hex2",
+                "com.kitlangton.Hex",
+                "com.kitlangton.Hex.debug"
+            ]
+        );
+        assert_eq!(default_mac_bundle_id(None), "anomaly.hex");
+        assert_eq!(default_mac_bundle_id(Some("0")), "anomaly.hex");
+        assert_eq!(default_mac_bundle_id(Some("1")), "anomaly.hex.test");
+
+        assert_eq!(
+            own_tcc_services(PermissionKind::Accessibility),
+            ["Accessibility"]
+        );
+        assert_eq!(
+            own_tcc_services(PermissionKind::SystemAudio),
+            ["AudioCapture"]
+        );
+        assert_eq!(
+            own_tcc_services(PermissionKind::ScreenRecording),
+            ["ScreenCapture"]
+        );
+        assert!(own_tcc_services(PermissionKind::Microphone).is_empty());
+
+        assert_eq!(
+            legacy_tcc_services(PermissionKind::Accessibility),
+            ["Accessibility"]
+        );
+        assert_eq!(
+            legacy_tcc_services(PermissionKind::SystemAudio),
+            ["ScreenCapture", "AudioCapture"]
+        );
+        assert_eq!(
+            legacy_tcc_services(PermissionKind::ScreenRecording),
+            ["ScreenCapture", "AudioCapture"]
+        );
+        assert!(legacy_tcc_services(PermissionKind::Microphone).is_empty());
+    }
+
+    #[test]
+    fn stale_tracker_waits_for_return_from_system_settings_and_ignores_touch_id_focus() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut tracker = StalePermissionTracker::default();
+        let in_settings = SettingsFocus {
+            settings_open: true,
+            settings_frontmost: true,
+            hex_active: false,
+        };
+        let touch_id_over_settings = SettingsFocus {
+            settings_open: true,
+            settings_frontmost: false,
+            hex_active: false,
+        };
+        let back_in_hex = SettingsFocus {
+            settings_open: true,
+            settings_frontmost: false,
+            hex_active: true,
+        };
+        let settings_closed = SettingsFocus {
+            settings_open: false,
+            settings_frontmost: false,
+            hex_active: false,
+        };
+
+        assert!(!tracker.poll(t0, true, back_in_hex));
+        tracker.note_asked(t0);
+        assert!(tracker.is_waiting());
+
+        // Staying in System Settings or authenticating in a Touch ID sheet
+        // never triggers the stale prompt prematurely.
+        assert!(!tracker.poll(t0 + Duration::from_secs(1), true, in_settings));
+        assert!(!tracker.poll(t0 + Duration::from_secs(12), true, touch_id_over_settings));
+
+        // Returning to Hex starts the 2 s grace window; granting clears it.
+        assert!(!tracker.poll(t0 + Duration::from_secs(13), true, back_in_hex));
+        assert!(!tracker.poll(t0 + Duration::from_millis(14_900), true, back_in_hex));
+        assert!(tracker.poll(t0 + Duration::from_secs(15), true, back_in_hex));
+        assert!(!tracker.poll(t0 + Duration::from_secs(16), false, back_in_hex));
+        assert!(!tracker.is_waiting());
+
+        // Closing System Settings without granting also triggers after 2 s.
+        tracker.note_asked(t0);
+        assert!(!tracker.poll(t0 + Duration::from_secs(1), true, in_settings));
+        assert!(!tracker.poll(t0 + Duration::from_secs(2), true, settings_closed));
+        assert!(tracker.poll(t0 + Duration::from_secs(4), true, settings_closed));
+
+        // Tiling window managers where Hex stays active beside System Settings
+        // fall back after STALE_SIDE_BY_SIDE_DELAY.
+        tracker.note_asked(t0);
+        assert!(!tracker.poll(t0 + Duration::from_secs(5), true, back_in_hex));
+        assert!(tracker.poll(t0 + STALE_SIDE_BY_SIDE_DELAY, true, back_in_hex));
+    }
+
+    #[test]
+    fn stale_accessibility_row_resets_permission_and_returns_to_waiting() {
+        let mut flow = Flow::new(Step::Setup, fresh_status(), true, true);
+        let untrusted = SetupStatus {
+            microphone: PermissionState::Ready,
+            accessibility: PermissionState::NeedsSettings,
+            transcription_model: false,
+        };
+        flow.on(Input::Status(untrusted, downloading(0.4)));
+        assert_eq!(
+            flow.on(Input::Grant(SetupItem::Accessibility)),
+            Effect::ShowGuide(PermissionKind::Accessibility)
+        );
+        assert_eq!(
+            statuses(&flow)[1],
+            (SetupItem::Accessibility, ItemStatus::Waiting, false)
+        );
+
+        flow.set_accessibility_stale(true);
+        assert_eq!(
+            statuses(&flow)[1],
+            (SetupItem::Accessibility, ItemStatus::Stale, false)
+        );
+        assert_eq!(
+            flow.on(Input::Grant(SetupItem::Accessibility)),
+            Effect::ResetPermission(PermissionKind::Accessibility)
+        );
+        assert_eq!(
+            statuses(&flow)[1],
+            (SetupItem::Accessibility, ItemStatus::Waiting, false)
+        );
     }
 }

@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use arboard::SetExtWindows;
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use windows_sys::Win32::System::DataExchange::{CountClipboardFormats, GetClipboardSequenceNumber};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -15,6 +16,19 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(500);
+
+/// Remote desktop clients (#866) forward a clipboard change to the remote
+/// session asynchronously, and the remote fetches the text only when it
+/// pastes. Ctrl+V sent at once can reach the remote before the new
+/// clipboard does, and a restore after 500 ms can replace the text before
+/// the remote asked for it, so both wait longer there.
+const REMOTE_DESKTOP_STEMS: &[&str] = &["mstsc", "msrdc"];
+const REMOTE_DESKTOP_PASTE_DELAY: Duration = Duration::from_millis(400);
+const REMOTE_DESKTOP_RESTORE_DELAY: Duration = Duration::from_secs(3);
+
+fn is_remote_desktop(stem: Option<&str>) -> bool {
+    stem.is_some_and(|stem| REMOTE_DESKTOP_STEMS.contains(&stem))
+}
 
 enum ClipboardSnapshot {
     Empty,
@@ -81,13 +95,13 @@ struct ClipboardRestore {
 impl ClipboardRestore {
     fn register(
         &mut self,
-        previous: ClipboardSnapshot,
+        previous: Option<ClipboardSnapshot>,
         previous_sequence: u32,
         inserted_sequence: u32,
     ) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         if self.last_sequence != Some(previous_sequence) {
-            self.original = Some(previous);
+            self.original = previous;
         }
         self.last_sequence = Some(inserted_sequence);
         self.generation
@@ -113,27 +127,51 @@ impl WindowsPaster {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let original_sequence = clipboard_sequence();
-        let snapshot = ClipboardSnapshot::read(&mut self.clipboard)?;
+        // A clipboard Hex can't snapshot (an app's private format) never
+        // blocks the paste: the transcript still goes in, and that
+        // clipboard just isn't restored afterwards.
+        let snapshot = match ClipboardSnapshot::read(&mut self.clipboard) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                tracing::warn!(%error, "pasting without restoring the previous Windows clipboard");
+                None
+            }
+        };
         wait_for_conflicting_modifiers();
         if clipboard_sequence() != original_sequence {
             return Err(eyre!(
                 "the clipboard changed while the transcript was being prepared"
             ));
         }
+        // Marked so Windows keeps the transcript out of clipboard history
+        // (Win+V) and cloud sync, as macOS marks it transient (#851).
         self.clipboard
-            .set_text(text.to_string())
+            .set()
+            .exclude_from_history()
+            .exclude_from_cloud()
+            .text(text.to_string())
             .wrap_err("could not place the transcript on the Windows clipboard")?;
         let transcript_sequence = clipboard_sequence();
         let generation = restore.register(snapshot, original_sequence, transcript_sequence);
         drop(restore);
 
+        let remote_desktop =
+            is_remote_desktop(crate::windows::input::foreground_process_stem().as_deref());
+        if remote_desktop {
+            thread::sleep(REMOTE_DESKTOP_PASTE_DELAY);
+        }
         if let Err(error) = send_paste_shortcut(self.paste_with_shift.load(Ordering::Relaxed)) {
             restore_clipboard_generation(&self.clipboard_restore, generation);
             return Err(error);
         }
         let clipboard_restore = self.clipboard_restore.clone();
+        let restore_delay = if remote_desktop {
+            REMOTE_DESKTOP_RESTORE_DELAY
+        } else {
+            CLIPBOARD_RESTORE_DELAY
+        };
         thread::spawn(move || {
-            thread::sleep(CLIPBOARD_RESTORE_DELAY);
+            thread::sleep(restore_delay);
             restore_clipboard_generation(&clipboard_restore, generation);
         });
         Ok(())
@@ -280,8 +318,8 @@ mod tests {
     fn rapid_pastes_keep_the_original_clipboard_for_the_latest_restore() {
         let mut restore = ClipboardRestore::default();
 
-        let first = restore.register(ClipboardSnapshot::Text("original".into()), 10, 11);
-        let second = restore.register(ClipboardSnapshot::Text("first paste".into()), 11, 12);
+        let first = restore.register(Some(ClipboardSnapshot::Text("original".into())), 10, 11);
+        let second = restore.register(Some(ClipboardSnapshot::Text("first paste".into())), 11, 12);
 
         assert_ne!(first, second);
         assert_eq!(restore.last_sequence, Some(12));
@@ -289,6 +327,25 @@ mod tests {
             restore.original.as_ref(),
             Some(ClipboardSnapshot::Text(text)) if text == "original"
         ));
+    }
+
+    #[test]
+    fn an_unreadable_clipboard_still_pastes_and_restores_nothing() {
+        let mut restore = ClipboardRestore::default();
+        restore.register(Some(ClipboardSnapshot::Text("old".into())), 1, 2);
+
+        restore.register(None, 10, 11);
+
+        assert_eq!(restore.last_sequence, Some(11));
+        assert!(restore.original.is_none());
+    }
+
+    #[test]
+    fn remote_desktop_clients_get_the_slower_paste() {
+        assert!(is_remote_desktop(Some("mstsc")));
+        assert!(is_remote_desktop(Some("msrdc")));
+        assert!(!is_remote_desktop(Some("notepad")));
+        assert!(!is_remote_desktop(None));
     }
 
     /// US-layout scan codes for the chord's keys.

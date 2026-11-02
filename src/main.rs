@@ -44,12 +44,15 @@ mod macos_rune;
 mod meeting;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod microphone_activity;
+mod net;
 #[cfg(target_os = "macos")]
 mod parakeet;
 #[cfg(target_os = "macos")]
 mod paste;
 #[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(dead_code))]
 mod personal_commands;
+#[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(dead_code))]
+mod policy;
 #[cfg(target_os = "macos")]
 mod recognition;
 mod rune_hud;
@@ -359,6 +362,14 @@ fn main() -> Result<()> {
             output,
         );
     }
+    // A headless render (`hex app -- --snap …`) draws fixtures: no data
+    // folder, log, lock, or settings, so it never touches the user's Hex.
+    if let Some(Command::App { rune_args, .. }) = &cli.command
+        && !rune_args.is_empty()
+    {
+        rune_ui::render_app(rune_args.clone()).run();
+        return Ok(());
+    }
     let log_dir = app_paths::init_process_logging(&SHUTDOWN)?;
 
     let event_path = log_dir.join("live.ndjson");
@@ -376,7 +387,7 @@ fn main() -> Result<()> {
         }
     });
     match command {
-        Command::App { device, rune_args } => open_app(event_path, device, rune_args),
+        Command::App { device, .. } => open_app(event_path, device),
         Command::Listen { device } => {
             let _instance = desktop::instance::acquire("listener")?;
             labs::log_launch();
@@ -564,14 +575,8 @@ fn main() -> Result<()> {
     }
 }
 
-/// Rune reads its own flags (`--snap`, `--scene`, …) from `rune_args`; a
-/// headless run draws fixtures without starting the runtime.
 #[cfg(target_os = "macos")]
-fn open_app(event_path: PathBuf, device: Option<String>, rune_args: Vec<String>) -> Result<()> {
-    if !rune_args.is_empty() {
-        crate::rune_ui::render_app(rune_args).run();
-        return Ok(());
-    }
+fn open_app(event_path: PathBuf, device: Option<String>) -> Result<()> {
     let _instance = desktop::instance::acquire("listener")?;
     labs::log_launch();
     audio::hex_microphone::host_service();

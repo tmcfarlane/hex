@@ -11,7 +11,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rune::{Anim, Cx, El, OverlayOptions, OverlayPlacement, OverlaySpec, ScreenEdge, row, text};
+use rune::{
+    Anim, Cx, El, OverlayHandle, OverlayOptions, OverlayPlacement, OverlaySpec, ScreenEdge, row,
+    text,
+};
 
 use super::controls::Paint;
 use crate::transcription::engine::Partial;
@@ -60,6 +63,32 @@ impl Spot {
             },
         }
     }
+
+    /// Places `overlay` for the plate to start at this spot.
+    fn apply(self, overlay: &OverlayHandle<Plate>) {
+        // Off macOS the HUD is placed with `place`, which picks the display
+        // again and measures from the same edge of its work area (above the
+        // Windows taskbar), so the plate is placed the same way and never
+        // lands under the HUD (#797).
+        #[cfg(not(target_os = "macos"))]
+        if let Self::Edge(edge, margin) = self {
+            overlay.place(edge, margin - PAD);
+            return;
+        }
+        overlay.set_placement(Some(self.placement()));
+    }
+}
+
+/// The plate's overlay, once installed.
+static LIVE: std::sync::OnceLock<rune::OverlayHandle<Plate>> = std::sync::OnceLock::new();
+
+/// Moves a shown plate to the display under the pointer when it changed
+/// (`rune_hud`'s follow, #807).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn refollow_pointer() {
+    if let Some(overlay) = LIVE.get() {
+        overlay.refollow_pointer();
+    }
 }
 
 /// Where the plate goes. Called on the app's thread each time the plate
@@ -88,6 +117,7 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>, place: Place) {
         ..Default::default()
     });
     let overlay = app.overlay(spec, Plate::default());
+    let _ = LIVE.set(overlay.clone());
     let shown = Arc::new(AtomicBool::new(false));
     crate::dictation::live_text::watch(move |partial| {
         let partial = partial.filter(|partial| !is_blank(partial));
@@ -114,7 +144,7 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>, place: Place) {
             if appearing {
                 // Placed and shown after the new words, so it appears
                 // where it belongs with them already drawn.
-                handle.set_placement(Some(place().placement()));
+                place().apply(&handle);
                 handle.show();
             }
         });
@@ -124,6 +154,27 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>, place: Place) {
 /// The model's first update often has no words yet.
 fn is_blank(partial: &Partial) -> bool {
     partial.stable.trim().is_empty() && partial.tentative.trim().is_empty()
+}
+
+/// About one space of the plate's font, between right-to-left stable and
+/// tentative words.
+const RTL_SPACE: f32 = 4.0;
+
+/// Whether the line's first strong letter is right-to-left (Hebrew, Arabic,
+/// Persian, Syriac, Thaana, N'Ko, and their presentation forms).
+fn is_right_to_left(stable: &str, tentative: &str) -> bool {
+    stable
+        .chars()
+        .chain(tentative.chars())
+        .find(|c| c.is_alphabetic() || is_rtl_letter(*c))
+        .is_some_and(is_rtl_letter)
+}
+
+fn is_rtl_letter(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}'
+    )
 }
 
 fn view(plate: &Plate, cx: &mut Cx<Plate>) -> El {
@@ -140,24 +191,37 @@ fn view(plate: &Plate, cx: &mut Cx<Plate>) -> El {
         return root;
     }
     // The newest words stay in view: the start gives way with "…".
-    let line = row()
-        .key("line")
-        .min_w(0.0)
-        .shrink()
-        .child(
-            text(plate.stable.trim().to_owned())
-                .key("stable")
-                .truncate_head()
-                .font(p.k.ty.ui)
-                .color(p.text()),
-        )
-        .children((!plate.tentative.trim().is_empty()).then(|| {
-            text(plate.tentative.clone())
-                .key("tentative")
-                .truncate()
-                .font(p.k.ty.ui)
-                .color(p.faint())
-        }));
+    let stable = text(plate.stable.trim().to_owned())
+        .key("stable")
+        .truncate_head()
+        .font(p.k.ty.ui)
+        .color(p.text());
+    let rtl = is_right_to_left(&plate.stable, &plate.tentative);
+    let tentative = (!plate.tentative.trim().is_empty()).then(|| {
+        let words = text(if rtl {
+            // A leading space would sit on the right-to-left line's far
+            // (right) side; the gap goes between the words instead.
+            plate.tentative.trim().to_owned()
+        } else {
+            plate.tentative.clone()
+        })
+        .key("tentative")
+        .truncate()
+        .font(p.k.ty.ui)
+        .color(p.faint());
+        let spaced = rtl
+            && !plate.stable.trim().is_empty()
+            && plate.tentative.starts_with(char::is_whitespace);
+        if spaced { words.mr(RTL_SPACE) } else { words }
+    });
+    let line = row().key("line").min_w(0.0).shrink();
+    // Right-to-left, the newer (tentative) words read after the stable ones,
+    // so they sit to their left.
+    let line = if rtl {
+        line.children(tentative).child(stable)
+    } else {
+        line.child(stable).children(tentative)
+    };
     root.child(
         row()
             .key("plate")
@@ -182,6 +246,7 @@ mod tests {
     const SHORT: &str = "So the plan for today";
     const LONG: &str = "So the plan for today is to finish the release notes, then check the \
         streaming numbers on the M4, and after lunch we can review the onboarding flow together";
+    const HEBREW: &str = "אז התוכנית להיום";
 
     fn runtime(stable: &str, tentative: &str, dark: bool) -> Runtime<Plate> {
         let plate = Plate {
@@ -236,6 +301,24 @@ mod tests {
             assert!(line < PLATE_H, "one line: {line}");
             assert_eq!(rect(&rt, "tentative").is_some(), !tentative.is_empty());
         }
+    }
+
+    #[test]
+    fn tentative_words_follow_the_stable_ones_in_reading_order() {
+        let rt = runtime(SHORT, " is to finish", false);
+        let [sx, _, sw, _] = rect(&rt, "stable").unwrap();
+        let [tx, _, _, _] = rect(&rt, "tentative").unwrap();
+        assert!(tx >= sx + sw - 0.5, "left to right: {sx} {sw} {tx}");
+
+        let rt = runtime(HEBREW, " והיום", false);
+        let [sx, _, _, _] = rect(&rt, "stable").unwrap();
+        let [tx, _, tw, _] = rect(&rt, "tentative").unwrap();
+        assert!(tx + tw < sx, "right to left, after a space: {tx} {tw} {sx}");
+
+        assert!(is_right_to_left(HEBREW, ""));
+        assert!(is_right_to_left("  ", " مرحبا"));
+        assert!(!is_right_to_left(SHORT, " שלום"));
+        assert!(!is_right_to_left("", ""));
     }
 
     #[test]
@@ -295,6 +378,7 @@ mod tests {
             ("short", SHORT, ""),
             ("long", LONG, ""),
             ("tentative", SHORT, " is to finish"),
+            ("rtl", HEBREW, " והיום"),
         ] {
             for dark in [false, true] {
                 let mut rt = runtime(stable, tentative, dark);

@@ -136,7 +136,10 @@ Use `models.list()` to discover available models rather than treating the export
 `MODEL_IDS` as an availability list. `apple_speech` remains in the public type but
 is currently unavailable in the native catalog. The optional `language` argument
 to `models.list()` affects readiness metadata, not language filtering; inspect
-each model's `languages` and `supportsLanguageDetection` fields.
+each model's `languages` and `supportsLanguageDetection` fields. `source` says
+where the file comes from: `download`, `hex`, `imported`, or
+`found: owner/name@abcdef1` for a model another app downloaded to the Hugging Face
+cache, which Hex uses where it is.
 
 ## Connect to HEX Desktop
 
@@ -159,16 +162,20 @@ const { transcript, durationMs } = await recording.finish()
 ```
 
 `connect()` finds the running Hex on macOS, Linux, and Windows. Desktop capture
-(`hex.dictation`) is macOS-only so far: elsewhere `capabilities().serviceCapture`
-is `false` and its routes answer `service-capture-unavailable`, while model
-preparation, transcription, and live streams work. Outside macOS there is no
+(`hex.dictation`) works on macOS and Linux while Hex is listening. On Windows
+`capabilities().serviceCapture` is `false` and its routes answer
+`service-capture-unavailable`, while model preparation, transcription, and live
+streams work. A recording never ends the user's shortcut dictation: starting
+one while the shortcut records is refused with `dictation-busy`, and the
+shortcut does nothing while yours records. Outside macOS there is no
 packaged helper yet; pass `command: ["hex", "service", "--embedded"]` to
 `create()` to run an installed Hex as the direct child.
 
 Call `recording.cancel()` to discard; Escape doesn't cancel a recording, so the
-key stays with your app. If the microphone fails mid-recording, `finish()` still
-transcribes the audio captured before the failure, or rejects with remote code
-`microphone-lost` when there was none. Subscribing to `recording.audio` enables a
+key stays with your app. If the microphone fails mid-recording, `finish()` on
+macOS still transcribes the audio captured before the failure, or rejects with
+remote code `microphone-lost` when there was none; on Linux it always rejects
+with `microphone-lost`. Subscribing to `recording.audio` enables a
 bounded best-effort mono Float32 PCM tap at `recording.sampleRate`. Desktop capture
 returns raw text and never pastes. `capabilities().serviceCapture` distinguishes
 desktop capture from the transcription-only helper. The recording handle renews

@@ -423,16 +423,16 @@ fn contributed_options_are_labs_toggles_off_by_default() {
 #[test]
 fn general_hides_advanced_options_until_asked() {
     let mut rt = runtime("mac-settings", true, PANE_SIZE);
-    assert!(rt.find("microphone-mode").is_none());
+    assert!(rt.find("shortcut-mode").is_some(), "under the shortcut");
+    assert!(rt.find("avoid-bluetooth-microphone").is_none());
     tap(&mut rt, "advanced-toggle");
-    assert!(rt.find("microphone-mode").is_some());
-    assert_eq!(
-        rt.find("double-tap-only").is_some(),
-        rt.state.settings.dictation_hotkey.key.is_some(),
-        "double-tap only needs a key chord"
+    assert!(rt.find("avoid-bluetooth-microphone").is_some());
+    tap(&mut rt, "advanced-toggle");
+    assert!(rt.find("avoid-bluetooth-microphone").is_none());
+    assert!(
+        rt.find("microphone-mode").is_some(),
+        "the mic switch is in General"
     );
-    tap(&mut rt, "advanced-toggle");
-    assert!(rt.find("microphone-mode").is_none());
 }
 
 /// General's level bars follow what the microphone hears, settle once it
@@ -473,29 +473,36 @@ fn the_microphone_level_follows_the_voice() {
     assert!(quiet.hear(Some(0.5)) && quiet.moving());
 }
 
+/// The row under the shortcut names the choice and opens Shortcut mode.
 #[test]
-fn double_tap_to_lock_shows_only_for_hold() {
-    let mut rt = runtime("mac-settings", true, TALL_SIZE);
-    open_advanced(&mut rt, Pane::General);
-    assert!(rt.find("double-tap").is_some());
-    pick(&mut rt, "shortcut-mode", 1);
-    assert_eq!(
-        rt.state.settings.shortcut_mode,
-        crate::dictation::ShortcutMode::Toggle
-    );
-    assert!(rt.find("double-tap").is_none());
+fn the_shortcut_mode_row_names_the_choice() {
+    let mut rt = runtime("mac-settings", true, PANE_SIZE);
+    let name = |rt: &Runtime<Ui>| element(rt, "shortcut-mode-control").label.clone();
+    assert_eq!(name(&rt).as_deref(), Some("Hold or double-tap"));
+    rt.state.settings.shortcut_mode = crate::dictation::ShortcutMode::Toggle;
+    refresh(&mut rt);
+    assert_eq!(name(&rt).as_deref(), Some("Tap"));
+    tap(&mut rt, "shortcut-mode-control");
+    assert!(rt.state.explainer.open);
 }
 
 #[test]
-fn how_it_works_opens_the_shortcut_explainer_and_keeps_focus_inside() {
+fn shortcut_mode_opens_from_its_row_and_keeps_focus_inside() {
     let mut rt = runtime("mac-settings", true, PANE_SIZE);
-    open_advanced(&mut rt, Pane::General);
-    tab_to(&mut rt, "shortcut-help");
+    rt.state.settings.dictation_hotkey.key = None;
+    refresh(&mut rt);
+    tab_to(&mut rt, "shortcut-mode-control");
     key(&mut rt, Key::Text(" ".into()), Mods::default());
     settle(&mut rt);
     assert!(rt.state.explainer.open);
-    tab_to(&mut rt, "mode-hold");
-    let stops = ["mode-toggle", "double-tap", "close-explainer", "mode-hold"];
+    tab_to(&mut rt, "trigger-hold-or-double-tap");
+    // A lone modifier can't double-tap, so that option takes no focus.
+    let stops = [
+        "trigger-hold",
+        "trigger-tap",
+        "shortcut-mode-done",
+        "trigger-hold-or-double-tap",
+    ];
     for stop in stops {
         key(&mut rt, Key::Tab, Mods::default());
         assert!(
@@ -508,56 +515,69 @@ fn how_it_works_opens_the_shortcut_explainer_and_keeps_focus_inside() {
     settle(&mut rt);
     assert!(!rt.state.explainer.open);
     assert!(
-        focused(&rt).ends_with("shortcut-help"),
+        focused(&rt).ends_with("shortcut-mode-control"),
         "focus went to {}",
         focused(&rt)
     );
 
-    // Return presses Close, the default button, even from a focused card.
-    let mode = rt.state.settings.shortcut_mode;
+    // Return presses Done, the default button, even from a focused option.
     key(&mut rt, Key::Text(" ".into()), Mods::default());
     settle(&mut rt);
-    tab_to(&mut rt, "mode-toggle");
+    tab_to(&mut rt, "trigger-tap");
     key(&mut rt, Key::Enter, Mods::default());
     settle(&mut rt);
     assert!(!rt.state.explainer.open);
-    assert_eq!(rt.state.settings.shortcut_mode, mode);
+    assert_eq!(
+        rt.state.settings.shortcut_mode,
+        crate::dictation::ShortcutMode::Hold
+    );
 }
 
 #[test]
-fn explainer_cards_pick_the_shortcut_mode() {
-    let mut rt = runtime("shortcut-explainer", true, PANE_SIZE);
-    let mode = |rt: &Runtime<Ui>| rt.state.settings.shortcut_mode;
-    assert_eq!(mode(&rt), crate::dictation::ShortcutMode::Hold);
-    assert!(
-        rt.find("shortcut-explainer/explainer-body/lock/double-tap")
-            .is_some()
-    );
-    tab_to(&mut rt, "mode-toggle");
+fn each_option_picks_its_trigger() {
+    use shortcut_mode::Trigger;
+    let mut rt = runtime("shortcut-mode-key", true, PANE_SIZE);
+    let trigger = |rt: &Runtime<Ui>| Trigger::of(&rt.state.settings);
+    assert_eq!(trigger(&rt), Trigger::DoubleTap);
+    tab_to(&mut rt, "trigger-tap");
     key(&mut rt, Key::Text(" ".into()), Mods::default());
     settle(&mut rt);
-    assert_eq!(mode(&rt), crate::dictation::ShortcutMode::Toggle);
+    assert_eq!(trigger(&rt), Trigger::Tap);
     assert_eq!(saved(&rt), 1);
-    assert!(
-        rt.find("shortcut-explainer/explainer-body/lock/double-tap")
-            .is_none(),
-        "Double-tap to lock is Hold's"
-    );
-    tap(&mut rt, "mode-hold");
-    assert_eq!(mode(&rt), crate::dictation::ShortcutMode::Hold);
-    tap(&mut rt, "shortcut-explainer/explainer-body/lock/double-tap");
-    assert!(!rt.state.settings.double_tap_lock);
-    tap(&mut rt, "close-explainer");
+    for (option, picked) in [
+        ("trigger-hold", Trigger::Hold),
+        ("trigger-hold-or-double-tap", Trigger::HoldOrDoubleTap),
+        ("trigger-double-tap", Trigger::DoubleTap),
+    ] {
+        tap(&mut rt, option);
+        assert_eq!(trigger(&rt), picked);
+    }
+    tap(&mut rt, "trigger-double-tap");
+    assert_eq!(saved(&rt), 4, "picking the choice again saves nothing");
+    tap(&mut rt, "shortcut-mode-done");
     assert!(!rt.state.explainer.open);
+
+    // With a lone modifier, Double-tap says why and does nothing.
+    let mut rt = runtime("shortcut-mode", true, PANE_SIZE);
+    let mut example = rt.state.settings.dictation_hotkey.clone();
+    example.key = Some(crate::app_settings::HotkeyKey::named("space"));
+    let why = format!(
+        "Needs a shortcut with a key, like {}",
+        example.keycaps().join("+")
+    );
+    assert!(texts(&rt).contains(&why));
+    tap(&mut rt, "trigger-double-tap");
+    assert_eq!(trigger(&rt), Trigger::HoldOrDoubleTap);
+    assert_eq!(saved(&rt), 0);
 }
 
 #[test]
 fn the_explainer_loops_on_the_poll_clock() {
-    let mut rt = runtime("shortcut-explainer-motion", true, PANE_SIZE);
+    let mut rt = runtime("shortcut-mode-motion", true, PANE_SIZE);
     let pressed = |rt: &Runtime<Ui>| {
         rt.elements()
             .into_iter()
-            .find(|e| e.path.ends_with("mode-hold/visual/keys/keycap0/cap"))
+            .find(|e| e.path.ends_with("trigger-hold/visual/keys/keycap0/cap"))
             .map(|e| e.target[1])
             .unwrap()
     };
@@ -567,7 +587,7 @@ fn the_explainer_loops_on_the_poll_clock() {
     assert!(pressed(&rt) > up, "the keycap goes down while held");
     rt.frame(2.0);
     assert_eq!(pressed(&rt), up, "and comes back up");
-    let held = runtime("shortcut-explainer", true, PANE_SIZE);
+    let held = runtime("shortcut-mode", true, PANE_SIZE);
     assert_eq!(held.state.explainer.time(), explainer::SNAPSHOT_MS);
 }
 
@@ -725,48 +745,38 @@ fn esc_stays_on_the_recorder_however_many_keys_are_held() {
 }
 
 #[test]
-fn the_practice_keys_stay_and_spring_back_up_on_release() {
-    let mut rt = runtime("mac-onboarding-try", true, PANE_SIZE);
-    let cap = |rt: &Runtime<Ui>| {
-        drawn(rt, "practice-hint/keys/keycap0/cap")
-            .expect("the keys stay")
-            .0
-    };
-    let hint = |rt: &Runtime<Ui>| drawn(rt, "practice-hint").unwrap().0;
-    let (rest, line) = (cap(&rt), hint(&rt));
-    onboarding::input(&mut rt.state, Input::Dictation(Observation::Started));
-    refresh(&mut rt);
-    assert!(cap(&rt)[1] > rest[1] + 0.5, "held down while it records");
-    assert_eq!(hint(&rt), line, "the page holds still");
-    onboarding::input(&mut rt.state, Input::Dictation(Observation::Transcribing));
-    rt.invalidate();
-    let mut last = cap(&rt)[1];
-    for _ in 0..30 {
-        rt.frame(1.0 / 60.0);
-        let now = cap(&rt)[1];
-        assert!(now <= last + 0.01, "the keys spring up, never back down");
-        assert_eq!(hint(&rt), line, "the page holds still");
-        last = now;
-    }
-    assert!((last - rest[1]).abs() < 0.05, "back at rest");
-    // A retry presses the keys standing up, from any outcome.
-    for outcome in [Observation::Discarded, Observation::Failed] {
-        onboarding::input(&mut rt.state, Input::Dictation(outcome));
-        refresh(&mut rt);
-        assert!((cap(&rt)[1] - rest[1]).abs() < 0.05, "up after {outcome:?}");
+fn the_practice_game_follows_hex_s_own_dictation_on_every_os() {
+    for scene in ["mac-onboarding-try", "onboarding-try"] {
+        let mut rt = runtime(scene, true, PANE_SIZE);
+        let holding = |rt: &Runtime<Ui>| {
+            rt.state
+                .first_run
+                .as_ref()
+                .is_some_and(|s| s.live_hold_from.is_some())
+        };
+        assert!(rt.find("done").is_some(), "{scene}: the game shows Done");
+        assert!(!holding(&rt));
         onboarding::input(&mut rt.state, Input::Dictation(Observation::Started));
         refresh(&mut rt);
-        assert!(
-            cap(&rt)[1] > rest[1] + 0.5,
-            "pressed again after {outcome:?}"
-        );
+        assert!(holding(&rt), "{scene}: the shortcut held, as Hex records");
+        onboarding::input(&mut rt.state, Input::Dictation(Observation::Transcribing));
+        refresh(&mut rt);
+        assert!(!holding(&rt), "{scene}: released");
     }
 }
 
+/// Shortcut mode's options, by key.
+const TRIGGERS: [&str; 4] = [
+    "trigger-hold-or-double-tap",
+    "trigger-hold",
+    "trigger-tap",
+    "trigger-double-tap",
+];
+
 #[test]
-fn the_explainer_draws_a_keycap_per_key_and_lines_up_the_lanes() {
+fn shortcut_mode_draws_a_keycap_per_key_and_lines_up_the_lanes() {
     use crate::app_settings::{HotkeyBinding, HotkeyModifiers};
-    let mut rt = runtime("shortcut-explainer-chord", true, PANE_SIZE);
+    let mut rt = runtime("shortcut-mode-chord", true, PANE_SIZE);
     let default = rt.state.settings.dictation_hotkey.clone();
     let one = HotkeyBinding {
         modifiers: HotkeyModifiers {
@@ -788,7 +798,7 @@ fn the_explainer_draws_a_keycap_per_key_and_lines_up_the_lanes() {
                 .unwrap_or_else(|| panic!("no {suffix}"))
         };
         let labels = binding.keycaps();
-        for owner in ["mode-hold", "mode-toggle", "double-tap"] {
+        for owner in TRIGGERS {
             let caps: Vec<_> = (0..labels.len())
                 .map(|index| rect(&format!("{owner}/visual/keys/keycap{index}")))
                 .collect();
@@ -806,75 +816,24 @@ fn the_explainer_draws_a_keycap_per_key_and_lines_up_the_lanes() {
                 assert_eq!(pair[0][1], pair[1][1], "{owner}'s keycaps share a baseline");
             }
         }
-        let hold = rect("mode-hold/visual/lanes");
-        let toggle = rect("mode-toggle/visual/lanes");
-        let lock = rect("double-tap/visual/lanes");
-        assert!(
-            (hold[0] - lock[0]).abs() < 0.5,
-            "{labels:?}: lanes start together"
-        );
-        assert!(
-            (hold[2] - toggle[2]).abs() < 0.5,
-            "{labels:?}: both cards' lanes are as wide"
-        );
+        let hold = rect("trigger-hold/visual/lanes");
+        for owner in TRIGGERS {
+            let lanes = rect(&format!("{owner}/visual/lanes"));
+            assert!(
+                (hold[0] - lanes[0]).abs() < 0.5 && (hold[2] - lanes[2]).abs() < 0.5,
+                "{labels:?}: {owner}'s lanes line up with Hold's"
+            );
+        }
         assert!(hold[2] > 30.0, "{labels:?}: lanes keep room to draw");
     }
 }
 
-/// Opened in either mode, the panel centres at its Hold height, so Hold and
-/// Toggle move only its bottom edge; resizing the window centres it again.
+/// A five-key chord widens the panel so every option's lanes keep room, and
+/// the keycaps stay inside their options.
 #[test]
-fn the_explainer_centres_at_its_hold_height_in_either_mode() {
-    fn panel(rt: &Runtime<Ui>) -> [f32; 4] {
-        rt.elements()
-            .into_iter()
-            .find(|e| e.key.as_deref() == Some("shortcut-explainer"))
-            .map(|e| e.target)
-            .expect("the panel")
-    }
-    for (size, scene) in [
-        (PANE_SIZE, "shortcut-explainer-toggle"),
-        (PANE_SIZE, "shortcut-explainer"),
-        ((900.0, 620.0), "shortcut-explainer-toggle"),
-    ] {
-        let mut rt = runtime(scene, true, size);
-        settle(&mut rt);
-        let opened = panel(&rt);
-        tap(&mut rt, "mode-hold");
-        settle(&mut rt);
-        let hold = panel(&rt);
-        assert!(
-            (hold[1] - opened[1]).abs() < 0.5,
-            "{scene}: the top moved from {} to {}",
-            opened[1],
-            hold[1]
-        );
-        assert!(
-            (hold[1] + hold[3] / 2.0 - size.1 / 2.0).abs() < 0.5,
-            "{scene}: Hold is centred in {size:?}: {hold:?}"
-        );
-        tap(&mut rt, "mode-toggle");
-        settle(&mut rt);
-        let toggle = panel(&rt);
-        assert!(
-            (toggle[1] - opened[1]).abs() < 0.5,
-            "{scene}: Toggle {opened:?} {hold:?} {toggle:?}"
-        );
-        rt.set_viewport((size.0, size.1 + 100.0), 1.0);
-        settle(&mut rt);
-        assert!(
-            (panel(&rt)[1] - opened[1] - 50.0).abs() < 0.5,
-            "{scene}: a taller window centres it again"
-        );
-    }
-}
-
-/// A five-key chord widens the panel so every card's lanes keep room, and
-/// the keycaps stay inside their cards.
-#[test]
-fn a_long_chord_widens_the_explainer() {
+fn a_long_chord_widens_shortcut_mode() {
     use crate::app_settings::{HotkeyBinding, HotkeyKey, HotkeyModifiers, ModifierSide};
-    let mut rt = runtime("shortcut-explainer-chord", true, PANE_SIZE);
+    let mut rt = runtime("shortcut-mode-chord", true, PANE_SIZE);
     let side = Some(ModifierSide::Either);
     rt.state.settings.dictation_hotkey = HotkeyBinding {
         modifiers: HotkeyModifiers {
@@ -895,11 +854,11 @@ fn a_long_chord_widens_the_explainer() {
             .map(|e| e.target)
             .unwrap_or_else(|| panic!("no {suffix}"))
     };
-    let panel = rect("shortcut-explainer");
+    let panel = rect("shortcut-mode-modal");
     assert!(panel[0] >= 0.0 && panel[0] + panel[2] <= PANE_SIZE.0);
-    for owner in ["modes/mode-hold", "modes/mode-toggle", "lock/double-tap"] {
+    for owner in TRIGGERS {
         let (card, keys, lanes) = (
-            rect(&format!("explainer-body/{owner}")),
+            rect(&format!("options/{owner}")),
             rect(&format!("{owner}/visual/keys")),
             rect(&format!("{owner}/visual/lanes")),
         );
@@ -910,7 +869,7 @@ fn a_long_chord_widens_the_explainer() {
         );
         assert!(
             lanes[0] + lanes[2] <= card[0] + card[2],
-            "{owner}'s lanes stay in the card"
+            "{owner}'s lanes stay in the option"
         );
     }
 }
@@ -919,7 +878,7 @@ fn a_long_chord_widens_the_explainer() {
 /// frame's poll; the tape starts again on the next.
 #[test]
 fn the_explainer_restarts_when_reduce_motion_turns_off() {
-    let mut rt = runtime("shortcut-explainer-motion", true, PANE_SIZE);
+    let mut rt = runtime("shortcut-mode-motion", true, PANE_SIZE);
     rt.set_system_reduced_motion(true);
     settle(&mut rt);
     assert_eq!(rt.state.explainer.time(), explainer::DONE);
@@ -1032,6 +991,27 @@ fn an_update_is_a_secondary_button_with_a_dot_and_its_own_label() {
 }
 
 #[test]
+fn a_staged_dev_build_lists_its_first_changes_under_the_update() {
+    let mut rt = runtime("mac-update-ready", true, PANE_SIZE);
+    assert!(
+        rt.find("sidebar-update-notes").is_none(),
+        "no notes, no list"
+    );
+    if let Some(view) = &mut rt.state.view {
+        view.update_notes = Some(crate::desktop::host::UpdateNotes {
+            items: ["One", "Two", "Three", "Four"].map(String::from).to_vec(),
+            url: "https://anoma.ly/hex/dev#0.0.0-dev-2".into(),
+        });
+    }
+    refresh(&mut rt);
+    let shown = texts(&rt);
+    assert!(shown.iter().any(|text| text == "What's new"));
+    assert!(shown.iter().any(|text| text == "· Three"));
+    assert!(!shown.iter().any(|text| text == "· Four"), "three at most");
+    assert!(rt.find("sidebar-update-control/dot").is_some());
+}
+
+#[test]
 fn meetings_off_offers_the_opt_in_and_keeps_the_pane() {
     let mut rt = runtime("meetings-off", true, PANE_SIZE);
     assert!(rt.find("meetings-view").is_none());
@@ -1069,12 +1049,12 @@ fn meetings_settings_save_and_ask_for_system_audio() {
         policy(&rt, "us.zoom.xos"),
         Some(MeetingPolicy::AlwaysRecord)
     );
-    pick(&mut rt, "call5-policy", 0);
+    pick(&mut rt, "call7-policy", 0);
     assert_eq!(
         policy(&rt, "problems.kitlangton.com"),
         Some(MeetingPolicy::Ask)
     );
-    assert!(rt.find("call5").is_some());
+    assert!(rt.find("call7").is_some());
     tap(&mut rt, "meetings-enabled");
     assert!(!rt.state.settings.meetings.enabled);
     assert!(rt.find("meeting-folder").is_none());
@@ -1296,30 +1276,29 @@ fn active_and_failed_meetings_show_their_state() {
 }
 
 #[test]
-fn the_mac_tour_asks_each_permission_then_practices() {
-    let mut rt = runtime("mac-onboarding-setup", true, PANE_SIZE);
+fn the_mac_first_run_asks_each_permission_then_practices() {
+    let mut rt = runtime("mac-onboarding-permissions", true, PANE_SIZE);
     assert_eq!(rt.state.tour.as_ref().unwrap().flow.step(), Step::Setup);
     assert!(
         matches!(sent(&rt), [Request::ChooseModel { .. }]),
         "the model downloads behind the permissions"
     );
-    tap(&mut rt, "setup-microphone/setup-grant-control/setup-grant");
+    tap(&mut rt, "mic-pill-allow");
     assert_eq!(
         asked(&rt),
         [PlatformRequest::Permission(
             PermissionAction::RequestMicrophone
         )]
     );
-    // macOS grants everything and the model lands: setup moves on.
+    // macOS grants everything and the model lands: the practice follows.
     use crate::desktop::onboarding::PermissionState::Ready;
     rt.state.platform.permissions.microphone = Ready;
     rt.state.platform.permissions.accessibility = Ready;
     rt.state.picker.installed = Some(vec![rt.state.settings.transcription.model]);
     refresh(&mut rt);
-    std::thread::sleep(std::time::Duration::from_millis(750));
+    rt.update(|ui, _| onboarding_kit::live::fixture_resume(ui, Page::Try));
     settle(&mut rt);
     assert_eq!(rt.state.tour.as_ref().unwrap().flow.step(), Step::TryIt);
-    assert!(rt.find("tour-skip").is_some(), "practice can be skipped");
     onboarding::input(&mut rt.state, Input::Dictation(Observation::Started));
     onboarding::input(&mut rt.state, Input::Dictation(Observation::Pasted));
     refresh(&mut rt);
@@ -1327,10 +1306,11 @@ fn the_mac_tour_asks_each_permission_then_practices() {
         rt.state.tour.as_ref().unwrap().flow.view().practice,
         Practice::Landed
     );
-    tap(&mut rt, "tour-continue");
-    assert_eq!(rt.state.tour.as_ref().unwrap().flow.step(), Step::Done);
-    tap(&mut rt, "tour-continue");
+    // Done leaves the game at any point; Start using Hex closes onboarding.
+    tap(&mut rt, "done");
+    tap(&mut rt, "start-using-hex");
     assert!(rt.state.tour.is_none());
+    assert!(rt.state.first_run.is_none());
 }
 
 #[test]
@@ -1344,7 +1324,7 @@ fn a_listener_that_will_not_start_relaunches_once_then_asks_to_reopen() {
     );
     assert_eq!(asked(&rt), [PlatformRequest::Relaunch]);
     let mut rt = runtime("mac-onboarding-reopen", true, PANE_SIZE);
-    tap(&mut rt, "tour-reopen");
+    tap(&mut rt, "reopen-hex");
     assert_eq!(asked(&rt), [PlatformRequest::Relaunch]);
 }
 
@@ -1352,7 +1332,7 @@ fn a_listener_that_will_not_start_relaunches_once_then_asks_to_reopen() {
 fn a_grant_waiting_for_a_restart_makes_setup_restart_hex() {
     let mut rt = runtime("mac-onboarding-restart", true, PANE_SIZE);
     assert_eq!(rt.state.tour.as_ref().unwrap().flow.step(), Step::Setup);
-    tap(&mut rt, "tour-continue");
+    tap(&mut rt, "restart");
     assert_eq!(asked(&rt), [PlatformRequest::Relaunch]);
 }
 
@@ -1363,15 +1343,135 @@ fn a_refused_microphone_points_to_system_settings() {
     assert!(
         shown
             .iter()
-            .any(|text| text == "Turned off earlier. Switch Hex on in System Settings.")
+            .any(|text| text == "Switch on Hex in System Settings")
     );
-    tap(&mut rt, "setup-microphone/setup-grant-control/setup-grant");
+    tap(&mut rt, "mic-pill-allow");
     assert_eq!(
         asked(&rt),
         [PlatformRequest::Permission(PermissionAction::ShowGuide(
             PermissionKind::Microphone
         ))]
     );
+}
+
+#[test]
+fn windows_onboarding_asks_only_for_the_microphone_switch() {
+    let mut rt = runtime("windows-onboarding-microphone", true, PANE_SIZE);
+    let shown = texts(&rt);
+    assert!(
+        shown.iter().any(|text| text == "Let Hex hear you"),
+        "{shown:?}"
+    );
+    assert!(rt.find("ax-row").is_none(), "no Accessibility on Windows");
+    tap(&mut rt, "mic-pill-allow");
+    assert_eq!(
+        asked(&rt),
+        [PlatformRequest::Permission(PermissionAction::ShowGuide(
+            PermissionKind::Microphone
+        ))]
+    );
+    // Switched on in Settings: the practice follows.
+    rt.state.platform.permissions.microphone = crate::desktop::onboarding::PermissionState::Ready;
+    rt.state.picker.installed = Some(vec![rt.state.settings.transcription.model]);
+    refresh(&mut rt);
+    rt.update(|ui, _| onboarding_kit::live::fixture_resume(ui, Page::Try));
+    settle(&mut rt);
+    assert_eq!(rt.state.tour.as_ref().unwrap().flow.step(), Step::TryIt);
+}
+
+#[test]
+fn stale_permissions_offer_fix_it_and_reset_entries_across_panes() {
+    // 1. Onboarding setup step.
+    let mut rt = runtime("mac-onboarding-stale", true, PANE_SIZE);
+    let shown = texts(&rt);
+    assert!(shown.iter().any(|text| text == "Still grey? Fix it"));
+    assert!(
+        shown
+            .iter()
+            .any(|text| text == "An older Hex entry can keep this off")
+    );
+    tap(&mut rt, "ax-pill-allow");
+    assert_eq!(
+        asked(&rt).last(),
+        Some(&PlatformRequest::Permission(
+            PermissionAction::ResetAndPrompt(PermissionKind::Accessibility)
+        ))
+    );
+    assert!(!rt.state.platform.stale(PermissionKind::Accessibility));
+
+    // 2. General › Permissions needed.
+    let mut rt = runtime("mac-settings-permissions-stale", true, PANE_SIZE);
+    let shown = texts(&rt);
+    assert!(shown.iter().any(|text| text == "Still grey? Fix it"));
+    assert!(
+        shown
+            .iter()
+            .any(|text| text == "An older Hex entry can keep this off")
+    );
+    tap(&mut rt, "permission-accessibility-allow");
+    assert_eq!(
+        asked(&rt),
+        [PlatformRequest::Permission(
+            PermissionAction::ResetAndPrompt(PermissionKind::Accessibility)
+        )]
+    );
+    assert!(!rt.state.platform.stale(PermissionKind::Accessibility));
+
+    // 3. Meetings › Settings › Screen & System Audio Recording.
+    let mut rt = runtime("meetings-settings", true, (980.0, 2400.0));
+    rt.state.platform.system_audio = false;
+    rt.state.platform.note_stale(PermissionKind::SystemAudio);
+    refresh(&mut rt);
+    let shown = texts(&rt);
+    assert!(shown.iter().any(|text| text == "Still grey? Fix it"));
+    assert!(
+        shown
+            .iter()
+            .any(|text| text == "An older Hex entry can keep this off")
+    );
+    tap(&mut rt, "meeting-system-audio-allow");
+    assert_eq!(
+        asked(&rt),
+        [PlatformRequest::Permission(
+            PermissionAction::ResetAndPrompt(PermissionKind::SystemAudio)
+        )]
+    );
+    assert!(!rt.state.platform.stale(PermissionKind::SystemAudio));
+}
+
+#[test]
+fn visible_untrusted_permission_rows_are_reported_for_legacy_cleanup() {
+    let mut rt = runtime("mac-onboarding-permissions", true, PANE_SIZE);
+    refresh(&mut rt);
+    assert_eq!(
+        rt.state.platform.permissions_shown,
+        [PermissionKind::Accessibility]
+    );
+
+    let mut rt = runtime("mac-settings-permissions", true, PANE_SIZE);
+    refresh(&mut rt);
+    assert_eq!(
+        rt.state.platform.permissions_shown,
+        [PermissionKind::Accessibility]
+    );
+
+    let mut rt = runtime("meetings-settings", true, (980.0, 2400.0));
+    rt.state.platform.system_audio = false;
+    refresh(&mut rt);
+    assert_eq!(
+        rt.state.platform.permissions_shown,
+        [PermissionKind::SystemAudio]
+    );
+
+    #[cfg(hex_capture)]
+    {
+        let mut rt = runtime("mac-scrawl-permission", true, PANE_SIZE);
+        refresh(&mut rt);
+        assert_eq!(
+            rt.state.platform.permissions_shown,
+            [PermissionKind::ScreenRecording]
+        );
+    }
 }
 
 /// The macOS and Windows surfaces in both appearances.
@@ -1387,17 +1487,16 @@ fn platform_goldens() {
             "meetings-settings",
             "meetings-off",
             "meetings-recording",
-            "mac-onboarding-setup",
-            "mac-onboarding-landed",
-            "shortcut-explainer",
-            "shortcut-explainer-toggle",
+            "mac-settings-permissions-stale",
+            "shortcut-mode",
+            "shortcut-mode-key",
             "sound-sets",
             "sound-sets-playing",
         ] {
             check_golden(scene, dark, PANE_SIZE);
         }
     }
-    check_golden("shortcut-explainer-chord", false, PANE_SIZE);
+    check_golden("shortcut-mode-chord", false, PANE_SIZE);
     check_golden("mac-settings-permissions", true, PANE_SIZE);
     check_golden("mac-settings-advanced", false, PANE_SIZE);
     check_golden("mac-microphone-bluetooth", true, PANE_SIZE);
@@ -1407,15 +1506,6 @@ fn platform_goldens() {
     check_golden("meetings-delete", false, PANE_SIZE);
     check_golden("meetings-rename", true, PANE_SIZE);
     check_golden("meetings-empty", false, PANE_SIZE);
-    check_golden("mac-onboarding", true, PANE_SIZE);
-    check_golden("mac-onboarding-progress", false, PANE_SIZE);
-    check_golden("mac-onboarding-denied", true, PANE_SIZE);
-    check_golden("mac-onboarding-download-failed", false, PANE_SIZE);
-    check_golden("mac-onboarding-listening", true, PANE_SIZE);
-    check_golden("mac-onboarding-reopen", false, PANE_SIZE);
-    check_golden("mac-onboarding-done", true, PANE_SIZE);
-    check_golden("mac-onboarding-mic-open", true, PANE_SIZE);
-    check_golden("mac-onboarding-mic-silent", false, PANE_SIZE);
 }
 
 #[test]
@@ -1762,45 +1852,6 @@ fn experiment_goldens() {
     check_golden("mac-activity", false, PANE_SIZE);
     check_golden("mac-settings-sides", true, PANE_SIZE);
     check_golden("mac-local-build", true, PANE_SIZE);
-}
-
-#[test]
-fn double_tap_to_lock_folds_away_under_the_rows_below() {
-    let mut rt = runtime("mac-settings", true, TALL_SIZE);
-    open_advanced(&mut rt, Pane::General);
-    let element = |rt: &Runtime<Ui>, key: &str| {
-        rt.elements()
-            .into_iter()
-            .find(|e| e.key.as_deref() == Some(key))
-            .unwrap_or_else(|| panic!("no element {key}"))
-    };
-    let edge = |rt: &Runtime<Ui>| {
-        let slot = element(rt, "double-tap-fold").rect;
-        slot[1] + slot[3]
-    };
-    let separator = element(&rt, "double-tap-only-fold").rect[1] - edge(&rt);
-    for mode in [1, 0] {
-        pick(&mut rt, "shortcut-mode", mode);
-        for _ in 0..30 {
-            rt.frame(1.0 / 60.0);
-            let bottom = edge(&rt);
-            let below = element(&rt, "double-tap-only-fold").rect[1];
-            assert!(
-                (below - bottom - separator).abs() < 0.01,
-                "the row below rides the slot's edge: {below} vs {bottom}"
-            );
-            if let Some(row) = rt.elements().into_iter().find(|e| {
-                e.key.as_deref() == Some("double-tap") && e.opacity > 0.0 && e.visible[3] > 0.0
-            }) {
-                let shown = row.visible[1] + row.visible[3];
-                assert!(
-                    shown <= bottom + 0.25,
-                    "the row shows {shown} past its slot's edge {bottom}"
-                );
-            }
-        }
-        settle(&mut rt);
-    }
 }
 
 #[test]

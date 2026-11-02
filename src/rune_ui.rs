@@ -16,9 +16,10 @@ mod controls;
 #[cfg(target_os = "macos")]
 pub(crate) mod deep_link;
 mod explainer;
+mod found;
+mod found_choice;
 mod fun;
 mod general;
-mod hero;
 mod history;
 #[cfg_attr(target_os = "linux", path = "rune_ui/linux_host.rs")]
 #[cfg_attr(target_os = "windows", path = "rune_ui/windows_host.rs")]
@@ -36,11 +37,14 @@ pub(crate) mod live_text;
 pub(crate) mod meeting_capsules;
 mod meetings;
 mod meetings_host;
+mod model_details;
+mod model_import;
 mod models;
 mod modes;
 mod onboarding;
 mod onboarding_kit;
 mod output;
+mod paste_access;
 mod picker;
 mod platform;
 mod platform_settings;
@@ -49,6 +53,8 @@ mod practice;
 #[cfg(hex_capture)]
 mod scrawl;
 mod settings;
+mod shortcut_mode;
+mod sidebar_update;
 mod sound_sets;
 mod spark;
 #[cfg(target_os = "macos")]
@@ -73,6 +79,7 @@ use crate::desktop::i18n::{tr, tr_fill};
 use crate::transcription::models::TranscriptionModelId;
 use controls::{METRICS, Paint};
 use host::{Backend, Request, ShortcutTarget};
+use onboarding_kit::live::Page;
 use settings::Capture;
 
 /// How long typing pauses before a text field's edit is saved.
@@ -141,10 +148,14 @@ pub(crate) fn run_app(
 ) {
     use crate::linux::service::{Activation, Control};
     rune::set_app_id(crate::linux::portal::APP_ID);
-    let mut app = self::app(Some(host.clone()))
-        .args(Vec::new())
-        .windowless()
-        .float_on_open();
+    let mut app = self::app(Some(host.clone())).args(Vec::new()).windowless();
+    // Tiling window managers float a window that maps at a fixed size.
+    // Desktops that float every window need no such map, and KWin on X11
+    // keeps a fixed-size window from fitting a small screen, its title bar
+    // out of reach (#736).
+    if !crate::linux::session::floats_windows() {
+        app = app.float_on_open();
+    }
     crate::linux::rune_hud::install(&mut app);
     live_text::install(&mut app, crate::rune_hud::live_text_place);
     // The capture capsule, picker, and ink.
@@ -185,6 +196,7 @@ pub(crate) fn run_app(
                         });
                     }
                     Control::Quit => {
+                        self::host::close_before_quit(&window);
                         quit.quit();
                         break;
                     }
@@ -205,10 +217,15 @@ pub(crate) fn run_app(
 /// opens.
 pub(crate) fn app(connect: host::Connect) -> rune::App<Ui> {
     onboarding_kit::set_live_window(true);
-    let app = build(connect, PlaygroundMode::Gated);
+    let app = build(move || Ui::load_with(connect), PlaygroundMode::Gated);
     #[cfg(target_os = "macos")]
     let app = app.on_open_url(on_open_url);
     app
+}
+
+/// Beside a setting an organization locked (`crate::policy`).
+fn managed_note() -> &'static str {
+    tr("Managed by your organization")
 }
 
 /// A `hex://` link the system opened with Hex: a story link opens the window
@@ -245,8 +262,10 @@ pub(crate) fn render_app(rune_args: Vec<String>) -> rune::App<Ui> {
         .iter()
         .any(|arg| arg == "--snap" || arg == "--video" || arg == "--list-scenes");
     onboarding_kit::set_live_window(playground && !headless);
+    // Fixtures only: a render never reads, migrates, or saves the user's
+    // settings, History, or anything else in the data folder.
     let app = build(
-        Default::default(),
+        Ui::fixture_base,
         if playground && playground::enabled() {
             PlaygroundMode::Attached
         } else {
@@ -265,30 +284,50 @@ pub(crate) fn render_app(rune_args: Vec<String>) -> rune::App<Ui> {
     app
 }
 
-/// The window's compositor: the UI, then the welcome hero over the tour's
-/// stage and the Sounds sheet's HUD over its stage.
+/// The window's compositor: the UI (through the first run's GPU stage or
+/// the practice game's strike and burn while they show), then the Sounds
+/// sheet's HUD over its stage.
 #[derive(Default)]
 pub(crate) struct WindowCompositor {
-    hero: hero::HeroCompositor,
+    onboarding: Option<onboarding_kit::gpu_stage::OnboardingGpu>,
+    game: Option<onboarding_kit::game_fx::GameFx>,
     sounds: sound_sets::Preview,
 }
 
 impl rune::compose::Compositor<Ui> for WindowCompositor {
     fn features(&self) -> wgpu::Features {
         // The Sounds sheet's HUD, and one device shared with the HUD overlay.
-        self.hero.features() | crate::rune_hud::Painter::FEATURES
-    }
-
-    fn animating(&self) -> bool {
-        self.hero.animating()
-    }
-
-    fn summary(&mut self, device: &wgpu::Device) -> Option<String> {
-        self.hero.summary(device)
+        crate::rune_hud::Painter::FEATURES
     }
 
     fn render(&mut self, f: &mut rune::compose::Frame<'_, Ui>) {
-        self.hero.render(f);
+        if f.rt
+            .marks
+            .iter()
+            .any(|&m| onboarding_kit::game_fx::is_game_mark(m))
+        {
+            self.game
+                .get_or_insert_with(|| onboarding_kit::game_fx::GameFx::new(f.device))
+                .render(f);
+        } else if self.onboarding.is_some()
+            || f.rt
+                .marks
+                .iter()
+                .any(|&m| onboarding_kit::gpu_stage::is_onboard_mark(m))
+        {
+            if self
+                .onboarding
+                .as_ref()
+                .is_none_or(|g| !g.matches(f.format))
+            {
+                self.onboarding = Some(onboarding_kit::gpu_stage::OnboardingGpu::new(
+                    f.device, f.format,
+                ));
+            }
+            self.onboarding.as_mut().expect("created above").render(f);
+        } else {
+            f.draw_ui();
+        }
         self.sounds.render(f);
     }
 }
@@ -304,14 +343,14 @@ enum PlaygroundMode {
     Gated,
 }
 
-fn build(connect: host::Connect, playground: PlaygroundMode) -> rune::App<Ui> {
+fn build(init: impl FnOnce() -> Ui + 'static, playground: PlaygroundMode) -> rune::App<Ui> {
     let spec = if playground == PlaygroundMode::None {
         spec()
     } else {
         playground::spec(spec())
     };
     let app = rune::App::new(spec)
-        .init(move || Ui::load_with(connect))
+        .init(init)
         .on_close(on_close)
         .compositor(WindowCompositor::default());
     // Linux records shortcuts from the window's keys, so a modifier pressed
@@ -508,6 +547,13 @@ pub(crate) fn meeting_corner_moved(
     ui.settings.meetings.recording_indicator_corner = corner;
 }
 
+/// An error from outside the window, such as settings that could not be read
+/// at launch, shown where save errors show.
+#[cfg(target_os = "macos")]
+pub(crate) fn show_error(ui: &mut Ui, error: String) {
+    ui.error = Some(error);
+}
+
 /// A meeting recording could not start or finish; the Meetings pane says why.
 pub(crate) fn meeting_failed(ui: &mut Ui, error: String) {
     ui.meetings.start_pending = false;
@@ -554,7 +600,7 @@ fn spec() -> AppSpec<Ui> {
         size: WINDOW_SIZE,
         // Narrower windows crowd the sidebar and rows.
         min_size: Some((860.0, 560.0)),
-        init: Ui::load,
+        init: Ui::fixture_base,
         view,
         scenes: SCENES,
         fonts: rune_theme_opencode::FONTS,
@@ -588,6 +634,7 @@ struct ServiceView {
     operation_error: Option<String>,
     transcription: DesktopTranscriptionSnapshot,
     update_status: DesktopUpdateStatus,
+    update_notes: Option<crate::desktop::host::UpdateNotes>,
     /// The service is recording or saving a shortcut.
     editing: bool,
 }
@@ -703,8 +750,6 @@ enum Menu {
     InputSourceModel(usize),
     /// An input source's language in keyboard model switching.
     InputSourceLanguage(usize),
-    /// The microphone under the tour's practice field.
-    TourMicrophone,
     /// How long History keeps dictations.
     HistoryRetention,
     /// The OpenCode thinking variant.
@@ -754,7 +799,6 @@ pub(crate) struct Ui {
     /// properties, which can block, so it runs off the UI thread.
     microphones_listing:
         Option<std::sync::mpsc::Receiver<Result<crate::audio::InputDevices, String>>>,
-    confirm_release: bool,
     mic_level: general::MicLevel,
     /// The panes whose Advanced fold is open.
     advanced: Vec<Pane>,
@@ -776,6 +820,8 @@ pub(crate) struct Ui {
     modes: modes::ModesPane,
     output: output::OutputPane,
     picker: picker::Picker,
+    /// Speech models already on this computer, and choosing one.
+    found: found::FoundState,
     explainer: explainer::Explainer,
     sound_sets: sound_sets::SoundSets,
     tour: Option<onboarding::Tour>,
@@ -804,8 +850,11 @@ struct Drafts {
 }
 
 impl Ui {
-    fn load() -> Self {
-        Self::load_with(host::Connect::default())
+    /// The state a headless render starts from before its scene: default
+    /// settings and a fixture service, built without touching the data
+    /// folder. The goldens start from it too.
+    fn fixture_base() -> Self {
+        Self::with(AppSettings::default(), Service::Fixture(Vec::new()))
     }
 
     fn load_with(connect: host::Connect) -> Self {
@@ -815,8 +864,14 @@ impl Ui {
         };
         crate::desktop::i18n::apply(settings.ui_language.as_deref());
         let store = host::history(&connect, settings.history_retention);
+        #[cfg(target_os = "linux")]
+        let paste = connect.is_some().then(paste_access::detect).flatten();
         let mut ui = Self::with(settings, Service::Pending(connect));
         ui.error = error;
+        #[cfg(target_os = "linux")]
+        {
+            ui.platform.paste = paste;
+        }
         // A mouse-button shortcut went back to its default: say so once.
         if ui.settings.mouse_shortcut_notice {
             ui.settings.mouse_shortcut_notice = false;
@@ -834,6 +889,7 @@ impl Ui {
             crate::dev_build::is_dev_build() && crate::DEVELOPER_FEATURES_ENABLED;
         ui.platform.hud.tuning = crate::rune_hud::dot_scope::lab();
         ui.tour = onboarding::Tour::start(&ui.settings, &ui.platform);
+        onboarding_kit::live::open(&mut ui);
         ui.platform.set_login_item(host::launch_at_login());
         ui
     }
@@ -855,7 +911,6 @@ impl Ui {
             microphones_listed_at: 0.0,
             input_sources_listed_at: f64::NEG_INFINITY,
             microphones_listing: None,
-            confirm_release: false,
             mic_level: general::MicLevel::default(),
             advanced: Vec::new(),
             labs_open: false,
@@ -871,6 +926,7 @@ impl Ui {
             modes,
             output: output::OutputPane::default(),
             picker: picker::Picker::default(),
+            found: found::FoundState::default(),
             explainer: explainer::Explainer::default(),
             sound_sets: sound_sets::SoundSets::default(),
             tour: None,
@@ -891,6 +947,11 @@ impl Ui {
 
     fn live(&self) -> bool {
         matches!(self.service, Service::Live(_))
+    }
+
+    /// A scene or test: nothing here runs on real time.
+    fn is_fixture(&self) -> bool {
+        matches!(self.service, Service::Fixture(_))
     }
 
     fn send(&mut self, request: Request) {
@@ -1001,6 +1062,13 @@ impl Ui {
                 {
                     view.screen_recording = true;
                 }
+                self.platform.clear_stale(*kind);
+                self.platform.note_asked(*kind);
+            }
+            platform::PlatformRequest::Permission(
+                crate::desktop::onboarding::PermissionAction::ResetAndPrompt(kind),
+            ) => {
+                self.platform.clear_stale(*kind);
                 self.platform.note_asked(*kind);
             }
             platform::PlatformRequest::SystemAudio => {
@@ -1010,6 +1078,7 @@ impl Ui {
                 if self.host.is_fixture() && self.platform.asked(kind) {
                     self.platform.system_audio = true;
                 }
+                self.platform.clear_stale(kind);
                 self.platform.note_asked(kind);
             }
             #[cfg(hex_capture)]
@@ -1173,7 +1242,7 @@ impl Ui {
 }
 
 /// Shortcut recording takes every key; Command-1 through 9 open the
-/// sidebar's panes in order; otherwise Escape closes the shortcut explainer,
+/// sidebar's panes in order; otherwise Escape closes Shortcut mode,
 /// the sound sets sheet, the picker, or the open menu.
 fn on_key(ui: &mut Ui, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
     if settings::on_key(ui, event, tx) {
@@ -1182,6 +1251,13 @@ fn on_key(ui: &mut Ui, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
     // Labs › Playground: ⇧⌘D (Ctrl+Shift+D off macOS) opens the playground.
     if event.key == rune::Key::Command('d') && event.mods.shift && playground::enabled() {
         tx.toggle_playground();
+        return true;
+    }
+    // Ctrl+Q quits Hex on Linux, as Quit Hex in the sidebar does (#808).
+    // macOS's menu bar owns ⌘Q; Windows quits from its tray.
+    #[cfg(target_os = "linux")]
+    if event.key == rune::Key::Command('q') && !event.mods.shift && !event.mods.alt {
+        ui.quit();
         return true;
     }
     if let rune::Key::Command(digit @ '1'..='9') = event.key
@@ -1260,7 +1336,11 @@ fn setup(ui: &mut Ui, waker: Waker) {
         let connect = std::mem::take(connect);
         #[cfg(target_os = "macos")]
         {
-            ui.host = platform::PlatformHost::Native(host::native_host());
+            let host_wake: Arc<dyn Fn() + Send + Sync> = {
+                let waker = waker.clone();
+                Arc::new(move || waker())
+            };
+            ui.host = platform::PlatformHost::Native(host::native_host(host_wake));
         }
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || waker());
         ui.service = Service::Live(Box::new(Backend::connect(connect, wake)));
@@ -1277,6 +1357,7 @@ fn poll(ui: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
     }
     let now = Instant::now();
     let mut changed = ui.save_drafts(now);
+    changed |= paste_access::poll(ui);
     changed |= labs::poll_flash(ui, now);
     // The OpenCode catalog is read only while the pane that uses it shows.
     changed |= ui.models.poll(
@@ -1301,12 +1382,14 @@ fn poll(ui: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
     }
     changed |= ui.modes.poll(ui.live());
     changed |= modes::poll_chooser(ui);
+    changed |= model_import::poll(ui);
+    changed |= found::poll(ui);
     let login_unknown = ui.platform.login_item.is_none();
     changed |= settings::poll_microphones(ui);
     // General names the input in use; list again when the OS reports an
     // input change. Windows reports a default change only to an open
     // default stream, so there the list is also refreshed every few seconds.
-    if (ui.pane == Pane::General || onboarding::shows_microphone(ui))
+    if ui.pane == Pane::General
         && ui.live()
         && ui.window.as_ref().is_some_and(rune::AppHandle::is_visible)
         && (ui.microphones_route != Some(crate::audio::input_route_generation())
@@ -1315,6 +1398,7 @@ fn poll(ui: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
         settings::refresh_microphones(ui);
         ui.microphones_listed_at = clock;
     }
+    platform_settings::update_shown_permissions(ui);
     changed |= ui.host.poll(&mut ui.platform);
     #[cfg(not(target_os = "macos"))]
     {
@@ -1451,12 +1535,8 @@ fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
     if let Some(modal) = vocabulary::modal(ui, p) {
         layer.extend(modal);
     }
-    let mut tour_layer = Vec::new();
     if let Some(first_run) = onboarding_kit::live::overlay(ui, p, cx.is_reduced_motion()) {
         layer.push(first_run);
-    } else if let Some(tour) = onboarding::overlay(ui, p, &mut tour_layer) {
-        layer.push(tour);
-        layer.extend(tour_layer);
     }
     rune_kit::root(window, layer).on_window_focus(window_focused)
 }
@@ -1512,36 +1592,6 @@ fn sidebar(ui: &Ui, p: Paint) -> El {
     }
     nav = nav.children(labs::playground_nav(ui, p));
     nav = nav.child(labs::nav(ui, p));
-    let action = match ui.view.as_ref().map(|view| &view.update_status) {
-        Some(DesktopUpdateStatus::ReadyToRestart) => Some((
-            tr("Restart to update").to_owned(),
-            DesktopAction::RestartIntoUpdate,
-        )),
-        Some(DesktopUpdateStatus::Available) => {
-            Some((tr("Download update").to_owned(), DesktopAction::OpenUpdate))
-        }
-        Some(DesktopUpdateStatus::SwitchAvailable { channel, version }) => Some((
-            crate::updater::switch_label(channel, version),
-            DesktopAction::ConfirmUpdateSwitch,
-        )),
-        _ => None,
-    };
-    // An available update is a state, not the screen's main action.
-    let update = action.map(|(label, action)| {
-        row()
-            .key("sidebar-update-control")
-            .gap(8.0)
-            .pl(6.0)
-            .center_y()
-            .child(controls::status_dot(p.accent()))
-            .child(controls::button(
-                p,
-                "sidebar-update",
-                &label,
-                controls::ButtonKind::Secondary,
-                move |ui: &mut Ui, _| ui.send(Request::Desktop(action.clone())),
-            ))
-    });
     title_bar(col())
         .key("sidebar")
         .role("navigation")
@@ -1553,7 +1603,8 @@ fn sidebar(ui: &Ui, p: Paint) -> El {
         .pr(6.0)
         .child(nav)
         .child(el().key("spacer").grow(1.0))
-        .children(update)
+        .children(sidebar_update::control(ui, p))
+        .children(sidebar_update::notes(ui, p))
         .children(host::QUIT_IN_WINDOW.then(|| quit_item(p)))
         .child(footer(ui, p))
 }
@@ -1859,6 +1910,8 @@ fn faded_body(key: &str, content: El, (top, bottom): (f32, f32)) -> El {
         .key(key)
         .grow(1.0)
         .shrink()
+        // Shrinks below its content in a fixed-height parent (#906).
+        .min_h(0.0)
         .clip_fade(0.0, top, 0.0, bottom)
         .scroll(ScrollSpec {
             stick_bottom: false,
@@ -1877,7 +1930,10 @@ const SCENES: &[Scene] = &[
     // (`--snap`): waits for its first snapshot instead of drawing
     // "Connecting…" at virtual time zero.
     ("live", |ui| {
-        *ui = Ui::load();
+        // Reads the saved settings and the running Hex; writes neither.
+        let settings = AppSettings::read().unwrap_or_default();
+        crate::desktop::i18n::apply(settings.ui_language.as_deref());
+        *ui = Ui::with(settings, Service::Fixture(Vec::new()));
         let mut backend = Backend::connect(Default::default(), Arc::new(|| {}));
         let deadline = Instant::now() + Duration::from_secs(5);
         while backend.state().is_none() && backend.error().is_none() && Instant::now() < deadline {
@@ -1933,7 +1989,6 @@ const SCENES: &[Scene] = &[
             default_is_hex_microphone: false,
             ..Default::default()
         });
-        ui.confirm_release = true;
     }),
     ("history", |ui| {
         *ui = portal_fixture();
@@ -1956,6 +2011,10 @@ const SCENES: &[Scene] = &[
         ui.output.expanded = Some(0);
         ui.output.prompt_copied = true;
         ui.pane = Pane::Output;
+    }),
+    ("output-trust", |ui| {
+        *ui = portal_fixture();
+        output::trust_fixture(ui);
     }),
     ("output-empty", |ui| {
         *ui = portal_fixture();
@@ -2001,13 +2060,33 @@ const SCENES: &[Scene] = &[
         *ui = portal_fixture();
         picker::fixture(ui, Some(TranscriptionModelId::CohereTranscribe));
     }),
-    // Japanese saved: the English-only models say they switch the language.
+    // Labs › Parakeet Ultra: its card's details, credit, and published
+    // benchmarks (lists Ultra only where the saved settings turn it on).
+    ("picker-parakeet-ultra", |ui| {
+        *ui = portal_fixture();
+        picker::parakeet_ultra_fixture(ui);
+    }),
+    // Every model, with the full list's Add model file….
+    ("picker-custom-models", |ui| {
+        *ui = portal_fixture();
+        picker::all_fixture(ui);
+    }),
+    // Found on this computer: Parakeet v3's exact file and an untested Whisper.
+    ("picker-found", |ui| {
+        *ui = portal_fixture();
+        ui.found.models = found::fixture();
+        picker::all_fixture(ui);
+    }),
+    // Japanese saved: Japanese models compared, SenseVoice downloading.
     ("picker-japanese", |ui| {
         *ui = portal_fixture();
-        ui.settings.transcription.model = TranscriptionModelId::WhisperLargeV3Turbo;
-        ui.settings.transcription.language = "ja".into();
-        ui.picker.installed = Some(vec![TranscriptionModelId::WhisperLargeV3Turbo]);
-        picker::fixture(ui, None);
+        picker::japanese_fixture(ui, Some(TranscriptionModelId::SenseVoiceSmall));
+    }),
+    // Every model: the English-only ones fold away and switch the language.
+    ("picker-japanese-all", |ui| {
+        *ui = portal_fixture();
+        picker::japanese_fixture(ui, None);
+        (ui.picker.view, ui.picker.others_open) = (picker::View::All, true);
     }),
     // Parakeet chosen over Japanese: Settings names the language change.
     ("language-fallback", |ui| {
@@ -2024,16 +2103,10 @@ const SCENES: &[Scene] = &[
         ui.picker.installed = Some(vec![TranscriptionModelId::WhisperLargeV3Turbo]);
         ui.open = Some(Menu::Pick("transcription-language"));
     }),
-    ("shortcut-explainer", |ui| {
-        *ui = mac_fixture();
-        ui.settings.double_tap_lock = true;
-        explainer::fixture(ui, Some(explainer::SNAPSHOT_MS));
-    }),
-    ("shortcut-explainer-toggle", |ui| {
-        *ui = mac_fixture();
-        ui.settings.shortcut_mode = crate::dictation::ShortcutMode::Toggle;
-        explainer::fixture(ui, Some(explainer::SNAPSHOT_MS));
-    }),
+    ("shortcut-mode", shortcut_mode::scene_modifier),
+    ("shortcut-mode-key", shortcut_mode::scene_key),
+    ("shortcut-mode-chord", shortcut_mode::scene_chord),
+    ("shortcut-mode-motion", shortcut_mode::scene_motion),
     // The Shortcut row with a modifier-only shortcut, Left Option, beside
     // its side picker (macOS), in each face of the recorder.
     ("shortcut-row", |ui| shortcut_row(ui, Capture::Idle)),
@@ -2065,27 +2138,44 @@ const SCENES: &[Scene] = &[
             },
         );
     }),
-    // A three-key chord: Control-Option-Space.
-    ("shortcut-explainer-chord", |ui| {
-        *ui = mac_fixture();
-        ui.settings.double_tap_lock = true;
-        let modifiers = &mut ui.settings.dictation_hotkey.modifiers;
-        modifiers.control = modifiers.option;
-        explainer::fixture(ui, Some(explainer::SNAPSHOT_MS));
-    }),
-    // Loops, for `--frames` clips.
-    ("shortcut-explainer-motion", |ui| {
-        *ui = mac_fixture();
-        ui.settings.double_tap_lock = true;
-        explainer::fixture(ui, None);
-    }),
+    // The first run on Linux (Windows is the same window): setting up Hex
+    // with nothing found, the model step with models found here, the demo,
+    // waiting for the model, the practice game, and Hex is ready.
     ("onboarding", |ui| {
-        *ui = portal_fixture();
-        onboarding::fixture(ui, crate::desktop::onboarding::Step::Welcome, false);
+        first_run(ui, FirstRun::Fresh, Page::Download)
     }),
-    ("onboarding-setup", |ui| {
-        *ui = portal_fixture();
+    ("onboarding-download-failed", |ui| {
+        first_run(ui, FirstRun::Failed, Page::Download)
+    }),
+    ("onboarding-model-found", found::listed),
+    ("onboarding-model-found-downloading", found::loading),
+    ("onboarding-model-found-recommended", found::present),
+    ("onboarding-model-found-back", found::chosen),
+    ("onboarding-demo", |ui| {
+        first_run(ui, FirstRun::Downloading, Page::Demo)
+    }),
+    ("onboarding-waiting", |ui| {
+        first_run(ui, FirstRun::Downloading, Page::Waiting)
+    }),
+    // GNOME and KDE on Wayland: why the desktop asks before the first paste.
+    ("onboarding-paste", |ui| {
+        first_run(ui, FirstRun::PasteAccess, Page::Permissions)
+    }),
+    ("onboarding-try", |ui| {
+        first_run(ui, FirstRun::Ready, Page::Try)
+    }),
+    ("onboarding-ready", |ui| {
+        first_run(ui, FirstRun::Ready, Page::Ready)
+    }),
+    // Windows with its microphone privacy switch off.
+    ("windows-onboarding-microphone", |ui| {
+        *ui = fixture(DesktopShortcuts::Registered);
+        ui.platform = platform::PlatformState::preview(platform::Capabilities::WINDOWS);
+        ui.host = platform::PlatformHost::Fixture(Vec::new());
+        ui.platform.permissions.microphone =
+            crate::desktop::onboarding::PermissionState::NeedsSettings;
         onboarding::fixture(ui, crate::desktop::onboarding::Step::Setup, true);
+        onboarding_kit::live::fixture(ui, Page::Permissions);
     }),
     // macOS and Windows surfaces, from preview data (see `platform`).
     ("mac-settings", |ui| *ui = mac_fixture()),
@@ -2222,16 +2312,10 @@ const SCENES: &[Scene] = &[
         };
     }),
     ("mac-settings-permissions", |ui| {
-        *ui = mac_fixture();
-        use crate::desktop::onboarding::PermissionState;
-        ui.platform.permissions.microphone = PermissionState::NeedsSettings;
-        ui.platform.permissions.accessibility = PermissionState::NeedsSettings;
-        ui.platform
-            .permissions_asked
-            .push(crate::desktop::onboarding::PermissionKind::Accessibility);
-        ui.platform.login_item =
-            Some(crate::desktop::login_item::LoginItemStatus::RequiresApproval);
-        ui.platform.accessibility_renamed = true;
+        platform_settings::mac_permissions_fixture(ui, false)
+    }),
+    ("mac-settings-permissions-stale", |ui| {
+        platform_settings::mac_permissions_fixture(ui, true)
     }),
     ("mac-settings-pause-browser", |ui| {
         *ui = mac_fixture();
@@ -2461,58 +2545,80 @@ const SCENES: &[Scene] = &[
             key: None,
         };
     }),
+    // The first run on macOS: setting up Hex, each permission state, the
+    // practice game, and Hex is ready.
     ("mac-onboarding", |ui| {
-        mac_tour(ui, onboarding::MacStep::Welcome)
+        mac_first_run(ui, onboarding::MacStep::Setup, Page::Download)
     }),
-    ("mac-onboarding-setup", |ui| {
-        mac_tour(ui, onboarding::MacStep::Setup)
-    }),
-    ("mac-onboarding-progress", |ui| {
-        mac_tour(ui, onboarding::MacStep::SetupProgress)
+    ("mac-onboarding-permissions", |ui| {
+        mac_first_run(ui, onboarding::MacStep::Setup, Page::Permissions)
     }),
     ("mac-onboarding-denied", |ui| {
-        mac_tour(ui, onboarding::MacStep::SetupDenied)
+        mac_first_run(ui, onboarding::MacStep::SetupDenied, Page::Permissions)
+    }),
+    ("mac-onboarding-stale", |ui| {
+        mac_first_run(ui, onboarding::MacStep::SetupStale, Page::Permissions)
     }),
     ("mac-onboarding-restart", |ui| {
-        mac_tour(ui, onboarding::MacStep::SetupRestart)
-    }),
-    ("mac-onboarding-download-failed", |ui| {
-        mac_tour(ui, onboarding::MacStep::SetupDownloadFailed)
+        mac_first_run(ui, onboarding::MacStep::SetupRestart, Page::Permissions)
     }),
     ("mac-onboarding-try", |ui| {
-        mac_tour(ui, onboarding::MacStep::TryIt)
-    }),
-    ("mac-onboarding-listening", |ui| {
-        mac_tour(ui, onboarding::MacStep::TryItListening)
-    }),
-    ("mac-onboarding-landed", |ui| {
-        mac_tour(ui, onboarding::MacStep::TryItLanded)
+        mac_first_run(ui, onboarding::MacStep::TryIt, Page::Try)
     }),
     ("mac-onboarding-reopen", |ui| {
-        mac_tour(ui, onboarding::MacStep::TryItReopen)
+        mac_first_run(ui, onboarding::MacStep::TryItReopen, Page::Try)
     }),
-    ("mac-onboarding-done", |ui| {
-        mac_tour(ui, onboarding::MacStep::Done)
+    ("mac-onboarding-ready", |ui| {
+        mac_first_run(ui, onboarding::MacStep::Done, Page::Ready)
     }),
-    ("mac-onboarding-mic", |ui| mic_tour(ui, MicScene::Hearing)),
-    ("mac-onboarding-mic-open", |ui| mic_tour(ui, MicScene::Open)),
-    ("mac-onboarding-mic-silent", |ui| {
-        mic_tour(ui, MicScene::Silent)
-    }),
-    ("mac-onboarding-mic-lid", |ui| {
-        mic_tour(ui, MicScene::LidClosed)
-    }),
-    // The welcome hero animating (`--video`, or a live window), and settled as
-    // Reduce Motion shows it.
-    ("onboarding-hero", |ui| hero_tour(ui, false)),
-    ("onboarding-hero-still", |ui| hero_tour(ui, true)),
 ];
 
-fn hero_tour(ui: &mut Ui, still: bool) {
-    mac_tour(ui, onboarding::MacStep::Welcome);
-    if let Some(tour) = &mut ui.tour {
-        tour.hero_still = still;
+/// The tour state a Linux first-run scene starts from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FirstRun {
+    /// Nothing installed; the recommended model just started downloading.
+    Fresh,
+    /// The download is a third of the way.
+    Downloading,
+    /// The download stopped.
+    Failed,
+    /// The model is installed.
+    Ready,
+    /// The model is installed, and the desktop asks before Hex's first
+    /// paste (GNOME and KDE on Wayland).
+    PasteAccess,
+}
+
+fn first_run(ui: &mut Ui, state: FirstRun, page: Page) {
+    *ui = portal_fixture();
+    onboarding::fixture(ui, crate::desktop::onboarding::Step::Setup, true);
+    match state {
+        FirstRun::Fresh => onboarding::set_downloaded(ui, 8),
+        FirstRun::Downloading => onboarding::set_downloaded(ui, 31),
+        FirstRun::Failed => {
+            if let Some(view) = &mut ui.view {
+                view.transcription.preparing = None;
+                view.transcription.error = Some("The connection was reset.".into());
+            }
+        }
+        FirstRun::Ready | FirstRun::PasteAccess => {
+            ui.picker.installed = Some(vec![ui.settings.transcription.model]);
+            if let Some(view) = &mut ui.view {
+                view.transcription.preparing = None;
+            }
+        }
     }
+    if state == FirstRun::PasteAccess {
+        ui.platform.paste = Some(paste_access::PasteAccess::Ask);
+    }
+    onboarding::poll(ui);
+    onboarding_kit::live::fixture(ui, page);
+}
+
+fn mac_first_run(ui: &mut Ui, step: onboarding::MacStep, page: Page) {
+    *ui = mac_fixture();
+    onboarding::mac_fixture(ui, step);
+    onboarding_kit::live::fixture(ui, page);
 }
 
 /// The Annotate pane with captures `enabled`, a 3-day video retention, and
@@ -2582,67 +2688,6 @@ fn listening(message: Option<&'static str>, held: HotkeyModifiers) -> Capture {
     }
 }
 
-fn mac_tour(ui: &mut Ui, step: onboarding::MacStep) {
-    *ui = mac_fixture();
-    onboarding::mac_fixture(ui, step);
-}
-
-/// What the tour's practice microphone shows in a scene.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MicScene {
-    /// Recording, and Hex hears the person.
-    Hearing,
-    /// Its menu of inputs open.
-    Open,
-    /// Recording, and Hex hears nothing.
-    Silent,
-    /// The lid closed and no other input.
-    LidClosed,
-}
-
-fn mic_tour(ui: &mut Ui, scene: MicScene) {
-    let recording = matches!(scene, MicScene::Hearing | MicScene::Silent);
-    mac_tour(
-        ui,
-        if recording {
-            onboarding::MacStep::TryItListening
-        } else {
-            onboarding::MacStep::TryIt
-        },
-    );
-    let built_in = "MacBook Pro Microphone".to_owned();
-    ui.microphones = Ok(if scene == MicScene::LidClosed {
-        crate::audio::InputDevices {
-            names: vec![built_in.clone()],
-            system_default: None,
-            off_with_lid_closed: Some(built_in),
-            default_is_off_with_lid_closed: true,
-            ..Default::default()
-        }
-    } else {
-        crate::audio::InputDevices {
-            names: vec![
-                "Kit Pods".into(),
-                built_in.clone(),
-                "Studio Display Microphone".into(),
-            ],
-            system_default: Some(built_in),
-            ..Default::default()
-        }
-    });
-    if scene == MicScene::Open {
-        ui.open = Some(Menu::TourMicrophone);
-    }
-    let microphone = ui.settings.microphone.clone();
-    if let Some(tour) = &mut ui.tour {
-        match scene {
-            MicScene::Hearing => tour.mic.level = 0.6,
-            MicScene::Silent => tour.mic.silent = Some(microphone),
-            _ => {}
-        }
-    }
-}
-
 fn portal_fixture() -> Ui {
     fixture(DesktopShortcuts::Portal(vec![
         DesktopGrantedShortcut {
@@ -2694,6 +2739,7 @@ fn fixture(shortcuts: DesktopShortcuts) -> Ui {
             preparing: None,
         },
         update_status: DesktopUpdateStatus::Current,
+        update_notes: None,
         editing: false,
     });
     ui
@@ -2704,6 +2750,9 @@ mod tests;
 
 #[cfg(test)]
 mod offscreen;
+
+#[cfg(test)]
+mod snap_isolation;
 
 #[cfg(test)]
 mod keyboard_model_tests;

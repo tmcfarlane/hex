@@ -132,16 +132,17 @@ fn command(host: &dyn Host, command: ControlCommand) -> ControlReply {
             action,
             print: true,
             raw,
-        } => reply(super::check_flags(action, true, raw).and_then(|()| {
+        } => reply(super::check_flags(action, true, raw).and_then(|action| {
             let (print, printed) = PrintReply::channel();
             host.dictation(action, Some(print), false)?;
             Ok(super::await_printed(&printed, super::PRINT_WAIT))
         })),
-        ControlCommand::Dictation { action, raw, .. } => reply(
-            super::check_flags(action, false, raw)
-                .and_then(|()| host.dictation(action, None, raw))
-                .map(|()| ControlReply::done(dictation_message(action))),
-        ),
+        ControlCommand::Dictation { action, raw, .. } => {
+            reply(super::check_flags(action, false, raw).and_then(|action| {
+                host.dictation(action, None, raw)
+                    .map(|()| ControlReply::done(dictation_message(action)))
+            }))
+        }
         ControlCommand::PasteLast => reply(
             host.paste_last()
                 .map(|()| ControlReply::done("Pasting the last dictation")),
@@ -245,7 +246,6 @@ fn dictation_message(action: CaptureAction) -> &'static str {
     match action {
         CaptureAction::Start => "Starting dictation",
         CaptureAction::Stop => "Stopping dictation",
-        CaptureAction::Cancel => "Cancelling dictation",
         CaptureAction::Toggle => "Toggling dictation",
     }
 }
@@ -275,10 +275,7 @@ fn meeting(stop: bool, title: Option<String>) -> ControlReply {
     use crate::meeting::MeetingRequest;
     use crate::meeting::watcher::MeetingMenuState;
     if !crate::app_settings::meetings_enabled() {
-        return ControlReply::error(
-            "feature-off",
-            "Meetings are off; turn them on with `hex settings set meetings.enabled on`",
-        );
+        return ControlReply::error("feature-off", crate::app_settings::meetings_off_reason());
     }
     let request = match (crate::meeting::runtime::state(), stop) {
         (MeetingMenuState::Recording { title, .. }, false) => {
@@ -725,7 +722,7 @@ mod tests {
     fn a_printing_stop_answers_with_the_transcript() {
         let host = FakeHost::default();
         let stop = |print| ControlCommand::Dictation {
-            action: CaptureAction::Stop,
+            action: CaptureAction::Stop.into(),
             print,
             raw: false,
         };
@@ -737,7 +734,7 @@ mod tests {
         );
         assert_eq!(code(&ask(&host, stop(false))), "ok");
         let start_print = ControlCommand::Dictation {
-            action: CaptureAction::Start,
+            action: CaptureAction::Start.into(),
             print: true,
             raw: false,
         };

@@ -2,12 +2,19 @@
 //! run in-process by embedded QuickJS ([`script`]) on one worker thread. The
 //! worker loads the config, reloads it when the config folder changes (keeping
 //! the last good registration when a reload fails), and answers transformation
-//! calls. The Modes pane reads its status from `personal-commands.json`.
+//! calls, each under its own timeout. A config that uses `fetch` or
+//! `node:child_process` reaches them only once the person allows that exact
+//! config ([`trust`]). The Output pane reads the status, including what to
+//! ask, from `personal-commands.json`.
 
+mod fetch;
+mod io;
+mod process;
 mod script;
+mod trust;
 mod typescript;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +28,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::dictation::context::ContextSnapshot;
 
+use io::Capabilities;
 use script::Script;
+pub use trust::Permissions;
 
 /// The config file names Hex looks for, in the config folder.
 const CONFIG_FILES: [&str; 2] = ["hex.config.ts", "hex.config.js"];
@@ -46,9 +55,15 @@ const MAX_WATCH_DEPTH: usize = 32;
 const MAX_STATUS_BYTES: usize = 256 * 1024;
 const MAX_STATUS_ERROR_BYTES: usize = 4096;
 const MAX_TRANSFORMATION_TEXT_BYTES: usize = 48 * 1024;
-/// How long a dictation waits for the worker, which may be loading a config
-/// first; each script call has its own shorter limit.
-const TRANSFORMATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// A transformation's limit unless it sets `timeout`: one second for plain
+/// JavaScript, thirty when its config can fetch or run programs.
+const PURE_TIMEOUT: Duration = Duration::from_secs(1);
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// The most `timeout` can ask for.
+const MAX_TIMEOUT: Duration = Duration::from_secs(60);
+/// How much longer than the chain's own limits a dictation waits for the
+/// worker, which may be loading a config or finishing earlier work first.
+const QUEUE_ALLOWANCE: Duration = Duration::from_secs(5);
 const LOWERCASE_TRANSFORMATION_ID: &str = "lowercase";
 const SPONGEBOB_TRANSFORMATION_ID: &str = "spongebob-case";
 const NO_TRAILING_PUNCTUATION_TRANSFORMATION_ID: &str = "no-trailing-punctuation";
@@ -87,6 +102,11 @@ fn builtin_transformation(id: &str) -> Option<&'static BuiltinTransformation> {
         .find(|transformation| transformation.id == id)
 }
 
+#[cfg(target_os = "macos")]
+pub fn is_builtin_transformation(id: &str) -> bool {
+    builtin_transformation(id).is_some()
+}
+
 /// `text` after the built-in transformation `id`, or None when `id` is not
 /// built in (a script runs in the transformation host instead).
 pub fn apply_builtin_transformation(id: &str, text: &str) -> Option<String> {
@@ -101,6 +121,9 @@ pub struct StatusSnapshot {
     pub transformations: Vec<StatusTransformation>,
     pub host_state: HostState,
     pub last_reload_error: Option<String>,
+    /// What the loaded config can reach, when it uses `fetch` or programs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Permissions>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -144,8 +167,19 @@ impl Default for StatusSnapshot {
             transformations: Vec::new(),
             host_state: HostState::NotConfigured,
             last_reload_error: None,
+            permissions: None,
         }
     }
+}
+
+/// The config hash the person allowed to use `fetch` and programs, if any.
+pub fn approved_config() -> Option<String> {
+    trust::approved(&crate::app_paths::transform_trust_file().ok()?)
+}
+
+/// Allows the loaded config whose files hash to `hash`.
+pub fn approve_config(hash: &str) -> Result<()> {
+    trust::approve(&crate::app_paths::transform_trust_file()?, hash)
 }
 
 pub fn load_status() -> Result<StatusSnapshot> {
@@ -205,7 +239,7 @@ fn validate_status(status: &StatusSnapshot) -> Result<()> {
 fn validate_transformations(
     transformations: &[StatusTransformation],
     label_prefix: &str,
-) -> Result<HashSet<String>> {
+) -> Result<()> {
     let mut ids = HashSet::new();
     for transformation in transformations {
         validate_text(
@@ -229,7 +263,7 @@ fn validate_transformations(
             return Err(eyre!("{label_prefix}transformation IDs must be unique"));
         }
     }
-    Ok(ids)
+    Ok(())
 }
 
 /// The config file in `workspace`, if there is exactly one.
@@ -342,12 +376,20 @@ pub struct PersonalCommands {
 }
 
 impl PersonalCommands {
+    /// Starts the host, unless an organization turned transformations off
+    /// (`DisableTransforms`).
     pub fn start(transformations: Arc<TransformationClient>) -> Option<Self> {
+        let lock = crate::policy::Lock::Transforms;
+        if crate::policy::Policy::current().locks(lock) {
+            tracing::info!("{}", lock.refusal());
+            return None;
+        }
         let (request_sender, requests) = mpsc::sync_channel(32);
         let stop = Arc::new(AtomicBool::new(false));
         let (done_sender, worker_done) = mpsc::sync_channel(1);
         let workspace = crate::app_paths::personal_commands_workspace().ok()?;
         let status_file = crate::app_paths::personal_commands_status_file().ok();
+        let trust_file = crate::app_paths::transform_trust_file().ok();
         let worker_transformations = transformations.clone();
         let worker_requests = request_sender.clone();
         let worker_stop = stop.clone();
@@ -361,8 +403,9 @@ impl PersonalCommands {
                     requests: worker_requests,
                     workspace,
                     status_file,
+                    trust_file,
                     generation: 0,
-                    script: None,
+                    loaded: None,
                     status: StatusSnapshot {
                         host_state: HostState::Starting,
                         ..StatusSnapshot::default()
@@ -411,11 +454,20 @@ struct Worker {
     requests: SyncSender<Request>,
     workspace: PathBuf,
     status_file: Option<PathBuf>,
+    /// Where the person's approval of a config's `fetch` and programs lives.
+    trust_file: Option<PathBuf>,
     /// Counts every load, so a stale transformation never reaches a newer config.
     generation: u64,
-    /// The loaded config and the generation it registered as.
-    script: Option<(u64, Script)>,
+    loaded: Option<Loaded>,
     status: StatusSnapshot,
+}
+
+/// The loaded config, the generation it registered as, and each
+/// transformation's time limit.
+struct Loaded {
+    generation: u64,
+    script: Script,
+    limits: HashMap<String, Duration>,
 }
 
 impl Worker {
@@ -433,7 +485,7 @@ impl Worker {
         let mut next_poll = Instant::now() + POLL_INTERVAL;
         while !stop.load(Ordering::Acquire) {
             match requests.recv_timeout(next_poll.saturating_duration_since(Instant::now())) {
-                Ok(Request::Transform(request)) => self.transform(*request),
+                Ok(Request::Transform(request)) => self.transform(*request, stop),
                 Ok(Request::Reload) => reload_now = true,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -469,7 +521,7 @@ impl Worker {
         let config = match find_config(&self.workspace) {
             Ok(Some(config)) => config,
             Ok(None) => {
-                if self.script.is_some() || self.status.host_state != HostState::NotConfigured {
+                if self.loaded.is_some() || self.status.host_state != HostState::NotConfigured {
                     self.deactivate();
                     self.persist();
                 }
@@ -486,15 +538,21 @@ impl Worker {
             Ok((script, candidate)) => {
                 self.transformations.activate(
                     self.generation,
-                    candidate.ids,
+                    candidate.limits.clone(),
                     self.requests.clone(),
                 );
-                self.script = Some((self.generation, script));
+                let permissions = script.permissions().clone();
+                self.loaded = Some(Loaded {
+                    generation: self.generation,
+                    script,
+                    limits: candidate.limits,
+                });
                 self.status = StatusSnapshot {
                     active_generation: Some(self.generation),
                     transformations: candidate.transformations,
                     host_state: HostState::Active,
                     last_reload_error: None,
+                    permissions: permissions.capabilities().any().then_some(permissions),
                 };
                 self.persist();
                 tracing::info!(
@@ -508,7 +566,7 @@ impl Worker {
     }
 
     fn reject(&mut self, error: &str) {
-        self.status.host_state = if self.script.is_some() {
+        self.status.host_state = if self.loaded.is_some() {
             HostState::Active
         } else {
             HostState::Unavailable
@@ -523,7 +581,7 @@ impl Worker {
 
     /// Forgets everything the last config registered.
     fn deactivate(&mut self) {
-        self.script = None;
+        self.loaded = None;
         self.transformations.clear();
         self.status = StatusSnapshot {
             host_state: HostState::NotConfigured,
@@ -540,30 +598,16 @@ impl Worker {
         }
     }
 
-    fn script(&self, generation: u64) -> Option<&Script> {
-        self.script
-            .as_ref()
-            .filter(|(loaded, _)| *loaded == generation)
-            .map(|(_, script)| script)
-    }
-
-    fn transform(&self, request: TransformationRequest) {
+    fn transform(&self, request: TransformationRequest, stop: &AtomicBool) {
         let started = Instant::now();
-        let result = match self.script(request.generation) {
+        let result = match self
+            .loaded
+            .as_ref()
+            .filter(|loaded| loaded.generation == request.generation)
+        {
             None => Err("custom transformation generation is unavailable".into()),
-            Some(script) => script
-                .transform(
-                    &json(&request.ids),
-                    &request.text,
-                    &json(&invocation_context(&request.context)),
-                )
-                .and_then(|text| {
-                    if text.len() > MAX_TRANSFORMATION_TEXT_BYTES {
-                        Err("custom transformation output is too large".into())
-                    } else {
-                        Ok(text)
-                    }
-                })
+            Some(loaded) => self
+                .run_chain(loaded, &request, stop)
                 .map_err(|error| bounded_error(&error)),
         };
         tracing::info!(
@@ -577,6 +621,58 @@ impl Worker {
             "custom transformation"
         );
         let _ = request.response.send(result);
+    }
+
+    /// Runs `request`'s transformations in order, each under its own limit.
+    fn run_chain(
+        &self,
+        loaded: &Loaded,
+        request: &TransformationRequest,
+        stop: &AtomicBool,
+    ) -> std::result::Result<String, String> {
+        let context = json(&invocation_context(&request.context));
+        let allowed = self.allowed(&loaded.script);
+        let mut text = request.text.clone();
+        for id in &request.ids {
+            let limit = loaded.limits.get(id).copied().unwrap_or(PURE_TIMEOUT);
+            let started = Instant::now();
+            let result = loaded
+                .script
+                .transform(id, &text, &context, limit, allowed, stop);
+            tracing::info!(
+                generation = loaded.generation,
+                id,
+                status = if result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                duration_ms = started.elapsed().as_millis() as u64,
+                "custom transformation step"
+            );
+            text = result?;
+            if text.len() > MAX_TRANSFORMATION_TEXT_BYTES {
+                return Err("custom transformation output is too large".into());
+            }
+        }
+        Ok(text)
+    }
+
+    /// The host APIs `script` may use: what it can reach, once the person
+    /// allowed this exact config.
+    fn allowed(&self, script: &Script) -> Capabilities {
+        let permissions = script.permissions();
+        let approved = permissions.capabilities().any()
+            && self
+                .trust_file
+                .as_deref()
+                .and_then(trust::approved)
+                .is_some_and(|hash| hash == permissions.hash);
+        if approved {
+            permissions.capabilities()
+        } else {
+            Capabilities::NONE
+        }
     }
 }
 
@@ -595,18 +691,44 @@ fn load_config(workspace: &Path, config: &str) -> Result<(Script, Candidate)> {
             "personal registry exceeds {MAX_TRANSFORMATIONS} transformations"
         ));
     }
-    let ids = validate_transformations(&registration.transformations, "")?;
+    let default_limit = if script.permissions().capabilities().any() {
+        IO_TIMEOUT
+    } else {
+        PURE_TIMEOUT
+    };
+    let limits = registration
+        .transformations
+        .iter()
+        .map(|transformation| {
+            let limit = transformation
+                .timeout
+                .map_or(default_limit, Duration::from_millis)
+                .min(MAX_TIMEOUT);
+            (transformation.id.clone(), limit)
+        })
+        .collect();
+    let transformations = registration
+        .transformations
+        .into_iter()
+        .map(|transformation| StatusTransformation {
+            id: transformation.id,
+            name: transformation.name,
+            description: transformation.description,
+        })
+        .collect::<Vec<_>>();
+    validate_transformations(&transformations, "")?;
     Ok((
         script,
         Candidate {
-            ids,
-            transformations: registration.transformations,
+            limits,
+            transformations,
         },
     ))
 }
 
 struct Candidate {
-    ids: HashSet<String>,
+    /// Each transformation's time limit, by id.
+    limits: HashMap<String, Duration>,
     transformations: Vec<StatusTransformation>,
 }
 
@@ -618,7 +740,17 @@ fn json(value: &impl Serialize) -> String {
 #[derive(Deserialize)]
 struct Registration {
     #[serde(default)]
-    transformations: Vec<StatusTransformation>,
+    transformations: Vec<RegisteredTransformation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredTransformation {
+    id: String,
+    name: String,
+    description: Option<String>,
+    /// Milliseconds; the default depends on what the config can reach.
+    timeout: Option<u64>,
 }
 
 #[derive(Default)]
@@ -629,7 +761,8 @@ pub struct TransformationClient {
 #[derive(Clone)]
 struct ActiveTransformations {
     generation: u64,
-    ids: HashSet<String>,
+    /// Each registered transformation's time limit, by id.
+    limits: HashMap<String, Duration>,
     requests: SyncSender<Request>,
 }
 
@@ -690,9 +823,14 @@ impl TransformationClient {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
             .ok_or_else(|| "custom transformations are unavailable".to_string())?;
-        if ids.iter().any(|id| !active.ids.contains(id)) {
+        let Some(budget) = ids
+            .iter()
+            .map(|id| active.limits.get(id).copied())
+            .sum::<Option<Duration>>()
+        else {
             return Err("mode references an unavailable custom transformation".into());
-        }
+        };
+        let budget = budget + QUEUE_ALLOWANCE;
         let (sender, receiver) = mpsc::sync_channel(1);
         active
             .requests
@@ -714,7 +852,7 @@ impl TransformationClient {
             if cancelled.load(Ordering::Acquire) {
                 return Err("dictation was cancelled".into());
             }
-            let remaining = TRANSFORMATION_TIMEOUT.saturating_sub(started.elapsed());
+            let remaining = budget.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 return Err("custom transformations timed out".into());
             }
@@ -728,13 +866,18 @@ impl TransformationClient {
         }
     }
 
-    fn activate(&self, generation: u64, ids: HashSet<String>, requests: SyncSender<Request>) {
+    fn activate(
+        &self,
+        generation: u64,
+        limits: HashMap<String, Duration>,
+        requests: SyncSender<Request>,
+    ) {
         *self
             .active
             .write()
             .unwrap_or_else(|error| error.into_inner()) = Some(ActiveTransformations {
             generation,
-            ids,
+            limits,
             requests,
         });
     }
@@ -880,6 +1023,8 @@ mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
 
+    mod host_apis;
+
     #[test]
     fn transformation_client_dispatches_only_registered_ids() {
         let (requests, receiver) = mpsc::sync_channel(1);
@@ -889,7 +1034,7 @@ mod tests {
             .write()
             .unwrap_or_else(|error| error.into_inner()) = Some(ActiveTransformations {
             generation: 4,
-            ids: HashSet::from(["prefix".into()]),
+            limits: HashMap::from([("prefix".into(), PURE_TIMEOUT)]),
             requests,
         });
         let worker = thread::spawn(move || {
@@ -1108,6 +1253,7 @@ mod tests {
             }],
             host_state: HostState::Active,
             last_reload_error: None,
+            permissions: None,
         };
 
         persist_status_at(&path, &status).unwrap();
@@ -1147,8 +1293,9 @@ mod tests {
                 requests,
                 workspace,
                 status_file: Some(root.join("personal-commands.json")),
+                trust_file: Some(root.join("transform-trust.json")),
                 generation: 0,
-                script: None,
+                loaded: None,
                 status: StatusSnapshot::default(),
             };
             worker.reload();
@@ -1168,6 +1315,13 @@ mod tests {
             self.worker.status.active_generation.unwrap_or(0)
         }
 
+        /// Allows the loaded config to use what it reaches, as the Output
+        /// pane's trust prompt does.
+        fn allow(&self) {
+            let permissions = self.worker.status.permissions.as_ref().unwrap();
+            trust::approve(self.worker.trust_file.as_ref().unwrap(), &permissions.hash).unwrap();
+        }
+
         fn error(&self) -> String {
             self.worker
                 .status
@@ -1178,13 +1332,16 @@ mod tests {
 
         fn transform(&self, ids: &[&str], text: &str) -> std::result::Result<String, String> {
             let (response, result) = mpsc::sync_channel(1);
-            self.worker.transform(TransformationRequest {
-                generation: self.generation(),
-                ids: ids.iter().map(ToString::to_string).collect(),
-                text: text.into(),
-                context: ContextSnapshot::default(),
-                response,
-            });
+            self.worker.transform(
+                TransformationRequest {
+                    generation: self.generation(),
+                    ids: ids.iter().map(ToString::to_string).collect(),
+                    text: text.into(),
+                    context: ContextSnapshot::default(),
+                    response,
+                },
+                &AtomicBool::new(false),
+            );
             result.recv().unwrap()
         }
     }
@@ -1297,7 +1454,7 @@ export default defineHexConfig({
             harness.transform(&["spin"], "hi").unwrap_err(),
             "timed out after 1000 ms"
         );
-        assert!(started.elapsed() < script::CALL_TIME_LIMIT * 2);
+        assert!(started.elapsed() < PURE_TIMEOUT * 2);
         assert!(
             harness
                 .transform(&["wait"], "hi")
@@ -1381,7 +1538,7 @@ export default defineHexConfig({
         fs::remove_file(harness.worker.workspace.join("hex.config.ts")).unwrap();
         harness.worker.reload();
         assert_eq!(harness.worker.status.host_state, HostState::NotConfigured);
-        assert!(harness.worker.script.is_none());
+        assert!(harness.worker.loaded.is_none());
     }
 
     #[test]
@@ -1394,13 +1551,16 @@ export default defineHexConfig({
         harness.write(
             r#"export default { transformations: { echo: { name: "Echo", transform: (t) => t + t } } }"#,
         );
-        harness.worker.transform(TransformationRequest {
-            generation: stale,
-            ids: vec!["echo".into()],
-            text: "a".into(),
-            context: ContextSnapshot::default(),
-            response,
-        });
+        harness.worker.transform(
+            TransformationRequest {
+                generation: stale,
+                ids: vec!["echo".into()],
+                text: "a".into(),
+                context: ContextSnapshot::default(),
+                response,
+            },
+            &AtomicBool::new(false),
+        );
         assert!(result.recv().unwrap().is_err());
         assert_eq!(harness.transform(&["echo"], "a").unwrap(), "aa");
     }
@@ -1438,7 +1598,7 @@ export default defineHexConfig({
         );
         assert_eq!(
             harness.transform(&["probe"], "").unwrap(),
-            "undefined undefined undefined undefined function"
+            "function function undefined undefined function"
         );
     }
 

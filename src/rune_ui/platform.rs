@@ -275,6 +275,13 @@ pub(super) struct PlatformState {
     pub(super) permissions: SetupStatus,
     /// Permissions whose Allow was pressed since they were last granted.
     pub(super) permissions_asked: Vec<PermissionKind>,
+    /// Permissions that stayed untrusted after returning from System Settings,
+    /// so their row offers `"Still grey? Fix it"`.
+    pub(super) permissions_stale: Vec<PermissionKind>,
+    /// Untrusted permissions whose row is visible right now, so the native
+    /// host clears retired Hex bundle IDs' stale TCC rows once in the
+    /// background.
+    pub(super) permissions_shown: Vec<PermissionKind>,
     /// Screen & System Audio Recording, for meetings.
     pub(super) system_audio: bool,
     /// `None` while the login item worker checks, or when it is unavailable.
@@ -293,6 +300,12 @@ pub(super) struct PlatformState {
     pub(super) calendar: CalendarView,
     /// The tour's relaunch failed; the person must reopen Hex.
     pub(super) relaunch_failed: bool,
+    /// The desktop's paste permission where Hex pastes through the
+    /// RemoteDesktop portal (GNOME and KDE on Wayland); `None` elsewhere.
+    pub(super) paste: Option<super::paste_access::PasteAccess>,
+    /// A scene's state: [`Self::setup_status`] reports `permissions` on
+    /// every OS rather than asking this computer.
+    preview: bool,
     /// Developer builds: keeps Meetings available without opt-in in debug builds
     /// (`crate::DEVELOPER_FEATURES_ENABLED` on a native host).
     pub(super) developer: bool,
@@ -353,6 +366,8 @@ impl PlatformState {
             input_sources: Vec::new(),
             permissions: crate::desktop::onboarding::status_with_transcription_model(false),
             permissions_asked: Vec::new(),
+            permissions_stale: Vec::new(),
+            permissions_shown: Vec::new(),
             system_audio: false,
             login_item: None,
             login_item_checking: false,
@@ -363,6 +378,8 @@ impl PlatformState {
             meeting_folder_error: None,
             calendar: CalendarView::default(),
             relaunch_failed: false,
+            paste: None,
+            preview: false,
             developer: false,
             accessibility_renamed: false,
             tuning: TunedFilterConfig::default(),
@@ -377,7 +394,7 @@ impl PlatformState {
     /// The permission state with `transcription_model` from the caller,
     /// which knows the selected model.
     pub(super) fn setup_status(&self, transcription_model: bool) -> SetupStatus {
-        if !self.caps.permissions {
+        if !self.caps.permissions && !self.preview {
             return crate::desktop::onboarding::status_with_transcription_model(
                 transcription_model,
             );
@@ -458,10 +475,43 @@ impl PlatformState {
         }
     }
 
+    pub(super) fn stale(&self, kind: PermissionKind) -> bool {
+        self.permissions_stale.contains(&kind)
+    }
+
+    pub(super) fn note_stale(&mut self, kind: PermissionKind) {
+        self.note_asked(kind);
+        if !self.stale(kind) {
+            self.permissions_stale.push(kind);
+        }
+    }
+
+    pub(super) fn clear_stale(&mut self, kind: PermissionKind) {
+        self.permissions_stale.retain(|entry| *entry != kind);
+    }
+
+    pub(super) fn control_for(
+        &self,
+        kind: PermissionKind,
+        permitted: bool,
+    ) -> super::lists::PermissionControl {
+        use super::lists::PermissionControl;
+        if permitted {
+            PermissionControl::Allowed
+        } else if self.stale(kind) {
+            PermissionControl::Stale
+        } else if self.asked(kind) {
+            PermissionControl::Waiting
+        } else {
+            PermissionControl::Allow
+        }
+    }
+
     /// Deterministic macOS state for scenes: every permission granted, the
     /// login item off, and the driver installed.
     pub(super) fn preview(caps: Capabilities) -> Self {
         let mut state = Self::new(caps);
+        state.preview = true;
         let ready = PermissionState::Ready;
         state.permissions = SetupStatus {
             microphone: ready,
@@ -611,11 +661,6 @@ pub(super) trait NativeHost {
     /// What the tour hears from the runtime: practice dictation outcomes
     /// while `practicing`, and a shortcut listener that failed to start.
     fn tour_inputs(&mut self, practicing: bool) -> Vec<Input>;
-    /// The microphone's latest peak, 0 to 1; silence when no audio arrived
-    /// lately. The tour reads it only while a practice dictation records.
-    fn practice_level(&self) -> f32 {
-        crate::audio::input_level::recent().unwrap_or(0.0)
-    }
 }
 
 pub(super) enum PlatformHost {
@@ -694,14 +739,6 @@ impl PlatformHost {
             Self::Native(host) => host.tour_inputs(practicing),
             Self::Local(practice) => practice.tour_inputs(practicing),
             Self::Fixture(_) => Vec::new(),
-        }
-    }
-
-    pub(super) fn practice_level(&self) -> f32 {
-        match self {
-            Self::Native(host) => host.practice_level(),
-            Self::Local(_) => crate::audio::input_level::recent().unwrap_or(0.0),
-            Self::Fixture(_) => 0.0,
         }
     }
 

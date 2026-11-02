@@ -5,13 +5,10 @@ private struct AppRecordingClockLabel: View {
     let dictation: DictationController
 
     var body: some View {
-        let formatted = HexTheme.formatClock(dictation.recordingDuration)
-        Text(formatted)
+        Text(HexTheme.formatClock(TimeInterval(dictation.recordingWholeSeconds)))
             .font(.system(size: 13, weight: .medium))
             .monospacedDigit()
-            .contentTransition(.numericText())
             .foregroundStyle(HexTheme.textBase)
-            .animation(.easeOut(duration: 0.16), value: formatted)
     }
 }
 
@@ -19,10 +16,9 @@ private struct AppWarmRemainingLabel: View {
     let dictation: DictationController
 
     var body: some View {
-        Text(HexTheme.formatRemaining(dictation.keyboardSessionRemaining))
+        Text(dictation.keyboardSessionDisplayRemaining)
             .font(.system(size: 13, weight: .medium))
             .monospacedDigit()
-            .contentTransition(.numericText())
             .foregroundStyle(HexTheme.textMuted)
     }
 }
@@ -45,6 +41,7 @@ struct ContentView: View {
     @Binding var showSetup: Bool
     @State private var setupMonitor = KeyboardSetupMonitor()
     @State private var practiceText = ""
+    @State private var showReturnAppsEditor = false
     @FocusState private var practiceFocused: Bool
 
     private static let stageWellHeight: CGFloat = 48
@@ -160,6 +157,7 @@ struct ContentView: View {
                 }
 
                 settingsCard
+                ExperimentsCard()
                 practiceField
             }
             .frame(maxWidth: 500)
@@ -472,7 +470,7 @@ struct ContentView: View {
 
                     Divider()
 
-                    ForEach(HostAppCatalog.all) { app in
+                    ForEach(dictation.quickReturnApps) { app in
                         Button {
                             dictation.setReturnAppID(app.id)
                         } label: {
@@ -483,9 +481,19 @@ struct ContentView: View {
                             }
                         }
                     }
+
+                    Divider()
+
+                    Button("Edit apps…") { showReturnAppsEditor = true }
                 } label: {
                     menuValueLabel(dictation.selectedReturnApp?.name ?? "Swipe back")
                 }
+            }
+            .sheet(isPresented: $showReturnAppsEditor) {
+                ReturnAppsSheet(
+                    chosen: dictation.quickReturnApps,
+                    onSave: dictation.setQuickReturnApps
+                )
             }
             .padding(.horizontal, 16)
             .frame(minHeight: 48)
@@ -557,8 +565,6 @@ struct ContentView: View {
         GeometryReader { geo in
             let bottomInset: CGFloat = Self.simulatesHomeButtonDevice ? 0 : geo.safeAreaInsets.bottom
             let hasHomeIndicator = bottomInset > 0
-            let homeBarWidth: CGFloat = round(min(max(geo.size.width * 0.355, 134), 156))
-            let swipeCueWidth: CGFloat = min(max(180, geo.size.width - 64), max(264, round(homeBarWidth * 1.95)))
 
             let mode = appStageMode
             let showScope = handoffScopePhase != .hidden
@@ -704,7 +710,7 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity)
                             .frame(height: handoffWellHeight)
                             .clipShape(Capsule())
-                            .hexControlReveal(showScope, reduceMotion: reduceMotion, scale: 0.96, blur: 2.5)
+                            .hexControlReveal(showScope, reduceMotion: reduceMotion, scale: 0.96, blur: 0.0)
 
                             VStack(spacing: 12) {
                                 ProgressView(value: dictation.modelPreparation.fractionCompleted)
@@ -736,7 +742,7 @@ struct ContentView: View {
                     // Quiet app quick-jump strip comfortably above the bottom gesture zone
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
-                            ForEach(HostAppCatalog.quickChips) { app in
+                            ForEach(dictation.quickReturnApps) { app in
                                 let isSelected = dictation.returnAppID == app.id
                                 Button {
                                     dictation.returnToHostApp(app, remember: true)
@@ -759,7 +765,7 @@ struct ContentView: View {
                     .hexScrollEdgeEffectHidden()
                     .hexHorizontalEdgeFade(leading: 16, trailing: 20)
                     .padding(.horizontal, -20)
-                    .padding(.bottom, hasHomeIndicator ? 18 : 12)
+                    .padding(.bottom, hasHomeIndicator ? 28 : 12)
                     .hexControlReveal(showReturnChips, reduceMotion: reduceMotion, scale: 0.97, blur: 2.5)
                 }
                 .frame(maxWidth: 500)
@@ -767,20 +773,21 @@ struct ContentView: View {
                 .padding(.top, 14)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                // Anchored directly onto the physical iOS Home Indicator bar (center 10.5 pt above screen bottom),
-                // shown only on Face ID / Dynamic Island devices (`bottomInset > 0`) when swipe-back is needed.
+                // Full-bottom-width Home-Indicator return cue (21 pt flush with screen bottom => center 10.5 pt
+                // above bottom edge, aligned dead-on the iOS Home Indicator pill across the full screen width).
                 if hasHomeIndicator {
-                    VStack(spacing: 5) {
+                    VStack(spacing: 3) {
                         Text("Swipe bar to return")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(HexTheme.textMuted)
+                            .font(.system(size: 11.5, weight: .medium))
+                            .tracking(0.1)
+                            .foregroundStyle(HexTheme.textFaint)
+                            .opacity(showHomeSwipeCue ? 1 : 0)
 
-                        DotSwipeCueView(isPaused: !showHomeSwipeCue)
-                            .frame(width: swipeCueWidth, height: 18)
+                        DotSwipeCueView(isActive: showHomeSwipeCue)
+                            .frame(width: geo.size.width, height: 21)
                     }
                     .allowsHitTesting(false)
-                    .hexControlReveal(showHomeSwipeCue, reduceMotion: reduceMotion, scale: 0.97, blur: 2.0, anchor: .bottom)
-                    .offset(y: max(CGFloat(0), bottomInset - 1.5))
+                    .offset(y: bottomInset)
                 }
             }
             .animation(HexMotion.stageAnimation(reduceMotion: reduceMotion), value: mode)

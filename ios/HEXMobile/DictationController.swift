@@ -90,13 +90,38 @@ final class DictationController {
     private(set) var transcript = ""
     @ObservationIgnored private(set) var audioLevel: Float = 0
     @ObservationIgnored private(set) var loudnessDB: Float = -120
-    private(set) var recordingDuration: TimeInterval = 0
+    @ObservationIgnored private var rawRecordingDuration: TimeInterval = 0
+    private(set) var recordingWholeSeconds: Int = 0
+    private(set) var recordingDuration: TimeInterval {
+        get { rawRecordingDuration }
+        set {
+            rawRecordingDuration = newValue
+            let whole = max(0, Int(newValue))
+            if recordingWholeSeconds != whole {
+                recordingWholeSeconds = whole
+            }
+        }
+    }
     private(set) var copied = false
     private(set) var keyboardSessionEnabled = false
-    private(set) var keyboardSessionRemaining: TimeInterval = 0
+    @ObservationIgnored private var rawKeyboardSessionRemaining: TimeInterval = 0
+    private(set) var keyboardSessionDisplayRemaining = "0:00"
+    private(set) var keyboardSessionRemaining: TimeInterval {
+        get { rawKeyboardSessionRemaining }
+        set {
+            rawKeyboardSessionRemaining = newValue
+            let formatted = HexTheme.formatRemaining(newValue)
+            if keyboardSessionDisplayRemaining != formatted {
+                keyboardSessionDisplayRemaining = formatted
+            }
+        }
+    }
+    @ObservationIgnored private var lastPublishedSnapshotSignature: String?
+    @ObservationIgnored private var lastPublishedSnapshotAt: TimeInterval = -100
     private(set) var warmDuration: WarmSessionDuration
     private(set) var style: DictationStyle
     private(set) var returnAppID: String?
+    private(set) var quickReturnApps: [HostApp]
     private(set) var allowBluetoothMic: Bool
     private(set) var autoReturnState: AutoReturnState = .idle
     private(set) var handoffNotice: String?
@@ -130,6 +155,7 @@ final class DictationController {
         self.warmDuration = resolvedBridge.warmDuration
         self.style = resolvedBridge.style
         self.returnAppID = resolvedBridge.returnAppID
+        self.quickReturnApps = resolvedBridge.quickReturnApps
         self.allowBluetoothMic = resolvedBridge.allowBluetoothMic
         self.defaultURLOpener = urlOpener ?? { url in
             await UIApplication.shared.open(url)
@@ -227,6 +253,15 @@ final class DictationController {
         let normalized = (id?.isEmpty == true) ? nil : id
         returnAppID = normalized
         keyboardBridge.returnAppID = normalized
+    }
+
+    /// Unticking the saved return app also forgets it, so the ↩ chip only ever names an app in the list.
+    func setQuickReturnApps(_ apps: [HostApp]) {
+        quickReturnApps = apps
+        keyboardBridge.quickReturnApps = apps
+        if let returnAppID, !apps.contains(where: { $0.id == returnAppID }) {
+            setReturnAppID(nil)
+        }
     }
 
     func setAllowBluetoothMic(_ allow: Bool) {
@@ -839,16 +874,23 @@ final class DictationController {
             while !Task.isCancelled {
                 guard let self,
                       let session = self.activeCapture,
-                      session.generation == generation,
-                      session.capture.isRecording else {
+                      session.generation == generation else {
                     break
+                }
+
+                // Recorder readiness is a sample, not the capture's lifetime. A transient
+                // false must not strand the app meter and keyboard heartbeat until Stop.
+                // Completion/interruption callbacks and explicit Stop own capture teardown.
+                guard session.capture.isRecording else {
+                    try? await Task.sleep(for: .milliseconds(33))
+                    continue
                 }
 
                 let db = session.capture.averagePowerDB()
                 self.loudnessDB = db
                 self.audioLevel = max(0, min(1, (db + 48) / 48))
                 self.recordingDuration = session.capture.currentTime
-                self.publishKeyboardSnapshot()
+                self.publishKeyboardSnapshot(minInterval: 0.10)
 
                 if self.recordingDuration >= Self.maxCaptureDuration - 0.25 {
                     self.finishRecording()
@@ -894,7 +936,9 @@ final class DictationController {
                 }
 
                 self.consumeKeyboardCommand()
-                self.publishKeyboardSnapshot()
+                if self.phase != .recording {
+                    self.publishKeyboardSnapshot(minInterval: 0.60)
+                }
                 try? await Task.sleep(for: .milliseconds(100))
             }
         }
@@ -903,6 +947,10 @@ final class DictationController {
     func processPendingKeyboardCommandForTesting() {
         consumeKeyboardCommand()
         publishKeyboardSnapshot()
+    }
+
+    func updateRecordingDurationForTesting(_ duration: TimeInterval) {
+        recordingDuration = duration
     }
 
     private func consumeKeyboardCommand() {
@@ -932,7 +980,7 @@ final class DictationController {
         }
     }
 
-    private func publishKeyboardSnapshot() {
+    private func publishKeyboardSnapshot(minInterval: TimeInterval = 0) {
         let currentTime = now()
 
         if let expires = keyboardResultExpiresAt, expires <= currentTime {
@@ -966,6 +1014,15 @@ final class DictationController {
         } else {
             failureMessage = keyboardMessage
         }
+
+        let signature = "\(state.rawValue)|\(activeKeyboardJobID ?? "")|\(keyboardResultID ?? "")|\(failureMessage ?? "")"
+        if minInterval > 0,
+           signature == lastPublishedSnapshotSignature,
+           currentTime - lastPublishedSnapshotAt < minInterval {
+            return
+        }
+        lastPublishedSnapshotSignature = signature
+        lastPublishedSnapshotAt = currentTime
 
         let effectiveHeartbeat: TimeInterval
         if state == .recording || state == .transcribing || (keyboardSessionEnabled && audio.isKeepaliveRunning) {

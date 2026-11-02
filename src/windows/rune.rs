@@ -36,7 +36,6 @@ use crate::desktop::host::{
     DesktopAction, DesktopListenerSnapshot, DesktopShortcut, DesktopTranscriptionSnapshot,
     DesktopUpdateStatus,
 };
-use crate::desktop::i18n::tr_fill;
 use crate::desktop::tray_menu::{TrayCommand, TrayView};
 use crate::history::History;
 use crate::rune_ui::Ui;
@@ -101,6 +100,7 @@ pub(crate) struct Published {
     pub(crate) operation_error: Option<String>,
     pub(crate) transcription: DesktopTranscriptionSnapshot,
     pub(crate) update_status: DesktopUpdateStatus,
+    pub(crate) update_notes: Option<crate::desktop::host::UpdateNotes>,
     pub(crate) settings: AppSettings,
     /// The running listener's state, for the tray.
     pub(crate) state: Option<crate::desktop::events::VoiceState>,
@@ -162,16 +162,7 @@ pub fn open(event_path: PathBuf, shutdown: &'static AtomicBool, start_hidden: bo
     };
     crate::labs::log_launch();
     shutdown.store(false, Ordering::Relaxed);
-    let (settings, settings_error) = match AppSettings::load() {
-        Ok(settings) => (settings, None),
-        Err(error) => (
-            AppSettings::default(),
-            Some(tr_fill(
-                "Could not load settings: {}",
-                &format!("{error:#}"),
-            )),
-        ),
-    };
+    let (settings, settings_error) = AppSettings::load_for_launch();
     let history = History::open_default(settings.history_retention)
         .inspect_err(|error| tracing::warn!(%error, "could not open retained history"))
         .ok();
@@ -227,7 +218,7 @@ pub fn open(event_path: PathBuf, shutdown: &'static AtomicBool, start_hidden: bo
         })
         .map_err(|_| eyre!("the Hex runtime already started"))?;
     let (control_calls, control_receiver) = mpsc::sync_channel(8);
-    let local_api = crate::local_api::LocalApi::start_for_app(&event_path, control_calls);
+    let local_api = crate::local_api::LocalApi::start_for_app(&event_path, control_calls, None);
     let quit = window.clone();
     let runtime_tray = tray.clone();
     let runtime_shared = shared.clone();

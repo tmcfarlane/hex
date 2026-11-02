@@ -1,3 +1,4 @@
+pub(crate) mod artifacts;
 pub(crate) mod background_priority;
 #[cfg(target_os = "macos")]
 pub(crate) mod benchmark;
@@ -6,12 +7,20 @@ pub(crate) mod benchmark;
     any(target_os = "linux", target_os = "windows")
 ))]
 pub(crate) mod cpu_floor;
+pub(crate) mod custom_models;
 pub(crate) mod engine;
+pub(crate) mod found_models;
+pub(crate) mod gguf_header;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) mod gguf_session;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) mod gpu_health;
 pub(crate) mod keyboard_model_switching;
+pub(crate) mod languages;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod local_transcriber;
+pub(crate) mod model_benchmarks;
+pub(crate) mod model_details;
 pub(crate) mod models;
 pub(crate) mod pause_segmenter;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]

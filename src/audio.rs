@@ -3,6 +3,7 @@ pub(crate) mod browser_media;
 #[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(dead_code))]
 pub(crate) mod hex_microphone;
 pub(crate) mod idle_sleep;
+mod input_format;
 pub(crate) mod input_level;
 pub(crate) mod instant;
 #[cfg(target_os = "macos")]
@@ -187,8 +188,8 @@ pub fn watch_input_devices() {
 }
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, SizedSample, Stream, StreamConfig};
+use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::{Device, SizedSample, Stream, StreamConfig};
 
 #[cfg(all(test, target_os = "macos"))]
 use instant::scale_mach_ticks;
@@ -272,6 +273,7 @@ pub struct RecoveringAudioInput {
     reports_new_devices: bool,
     opener: Opener,
     route_generation_source: fn() -> u64,
+    outage: Option<Option<String>>, // why no input opens; `Some(None)` once taken
 }
 
 /// Whether a listener's capture is idle, so [`RecoveringAudioInput`] may
@@ -456,65 +458,22 @@ impl AudioInput {
         #[cfg(target_os = "macos")]
         watch_input_devices();
         let restart_generation = audio_service_restart_generation();
-        let supported = device
-            .default_input_config()
-            .wrap_err("could not read the input device configuration")?;
-        let sample_format = supported.sample_format();
-        let config: StreamConfig = supported.into();
-        let sample_rate = config.sample_rate;
-        let channels = usize::from(config.channels);
-        let (sender, chunks) = mpsc::channel();
-        let (error_sender, stream_errors) = mpsc::sync_channel(1);
-        let reporter = StreamErrorReporter {
-            sender: error_sender,
-            default_name: follows_default.then(|| device_name.clone()),
-        };
-        let (feed, hex_microphone) = crate::audio::hex_microphone::capture_feed(sample_rate);
-
-        let stream = match sample_format {
-            SampleFormat::F32 => build_stream(
-                &device,
-                &config,
-                channels,
-                sender,
-                reporter.clone(),
-                feed,
-                |sample: f32| sample,
-            )?,
-            SampleFormat::I16 => build_stream(
-                &device,
-                &config,
-                channels,
-                sender,
-                reporter.clone(),
-                feed,
-                |sample: i16| sample as f32 / i16::MAX as f32,
-            )?,
-            SampleFormat::U16 => build_stream(
-                &device,
-                &config,
-                channels,
-                sender,
-                reporter.clone(),
-                feed,
-                |sample: u16| sample as f32 / 32768.0 - 1.0,
-            )?,
-            format => return Err(eyre!("unsupported microphone sample format: {format:?}")),
-        };
-        stream
-            .play()
-            .wrap_err("could not start microphone capture")?;
+        let started = input_format::start_stream_with_fallback(
+            &device,
+            &device_name,
+            follows_default.then(|| device_name.clone()),
+        )?;
 
         Ok(Self {
-            _stream: Some(stream),
-            chunks,
-            sample_rate,
+            _stream: Some(started.stream),
+            chunks: started.chunks,
+            sample_rate: started.sample_rate,
             device_name,
             selection: Selection::InUse,
-            stream_errors,
+            stream_errors: started.stream_errors,
             watch_service_restarts: true,
             restart_generation,
-            hex_microphone,
+            hex_microphone: started.hex_microphone,
         })
     }
 
@@ -587,6 +546,7 @@ impl RecoveringAudioInput {
             }
             Err(error) => {
                 tracing::warn!(%error, "could not open dictation microphone at startup; retrying");
+                self.outage.get_or_insert(Some(error.to_string()));
                 self.recovery.request_stream_recovery(now);
                 self.recovery.failed(now);
             }
@@ -610,7 +570,13 @@ impl RecoveringAudioInput {
             reports_new_devices: cfg!(target_os = "macos"),
             opener: Arc::new(open_configured_input),
             route_generation_source: input_route_generation,
+            outage: None,
         }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn take_failure(&mut self) -> Option<String> {
+        self.outage.as_mut().and_then(Option::take)
     }
 
     /// An input whose opens and route changes come from the test.
@@ -670,6 +636,7 @@ impl RecoveringAudioInput {
         }
         input.feed_hex_microphone(true);
         self.input = Some(input);
+        self.outage = None;
     }
 
     pub fn close(&mut self) {
@@ -678,6 +645,7 @@ impl RecoveringAudioInput {
         }
         self.replacement = None;
         self.recovery.recovered();
+        self.outage = None;
     }
 
     pub fn is_open(&self) -> bool {
@@ -766,6 +734,9 @@ impl RecoveringAudioInput {
                         %error,
                         "could not reopen dictation microphone; retrying"
                     );
+                    if self.recovery.blocks_audio() {
+                        self.outage.get_or_insert(Some(error));
+                    }
                 }
             }
         }
@@ -1861,6 +1832,23 @@ mod tests {
             ),
             found(Named(0), Selection::InUse)
         );
+    }
+
+    #[test]
+    fn a_microphone_that_cannot_open_is_reported_once_per_outage() {
+        let mut input = RecoveringAudioInput::failed_for_test("Gone microphone");
+        let failure = input
+            .take_failure()
+            .expect("the startup failure is reported");
+        assert!(failure.contains("Gone microphone"), "{failure}");
+        assert_eq!(input.take_failure(), None);
+        // Retries within the same outage stay quiet.
+        input.outage.get_or_insert(Some("still gone".into()));
+        assert_eq!(input.take_failure(), None);
+        // Closing ends the outage; the next one is reported again.
+        input.close();
+        input.outage.get_or_insert(Some("gone again".into()));
+        assert_eq!(input.take_failure().as_deref(), Some("gone again"));
     }
 
     #[test]

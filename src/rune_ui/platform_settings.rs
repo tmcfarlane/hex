@@ -12,6 +12,7 @@ use super::controls::{
     select, setting_row,
 };
 use super::lists::{PermissionControl, Tone, permission_control, tone_tag};
+use super::paste_access::PasteAccess;
 use super::platform::{CalendarRequest, MeetingRequest, NotesAvailability, Os, PlatformRequest};
 use super::settings::toggle_menu;
 use super::{Menu, Pane, ShortcutTarget, Ui, icons};
@@ -65,7 +66,18 @@ pub(super) fn accessibility_name(renamed: bool) -> &'static str {
 
 /// The missing permissions above everything else, while the tour is closed.
 pub(super) fn permissions_section(ui: &Ui, p: Paint) -> Option<El> {
-    if !ui.platform.caps.permissions || ui.tour.is_some() {
+    if ui.tour.is_some() {
+        return None;
+    }
+    if let Some(paste) = paste_permission(ui, p) {
+        return Some(section(
+            p,
+            "permissions",
+            tr("Permissions needed"),
+            vec![paste],
+        ));
+    }
+    if !ui.platform.caps.permissions {
         return None;
     }
     let warnings = crate::desktop::onboarding::permission_warnings(ui.platform.permissions);
@@ -94,21 +106,118 @@ pub(super) fn permissions_section(ui: &Ui, p: Paint) -> Option<El> {
                     ),
                 );
             }
+            let stale =
+                warning.kind == PermissionKind::Accessibility && ui.platform.stale(warning.kind);
+            let description = if stale {
+                tr("An older Hex entry can keep this off")
+            } else {
+                description
+            };
+            let action = if stale {
+                PermissionAction::ResetAndPrompt(warning.kind)
+            } else {
+                warning.action
+            };
             let control = permission_control(
                 p,
                 &format!("{key}-allow"),
-                if ui.platform.asked(warning.kind) {
-                    PermissionControl::Waiting
-                } else {
-                    PermissionControl::Allow
-                },
+                ui.platform.control_for(warning.kind, false),
                 ButtonKind::Secondary,
-                move |ui: &mut Ui| ui.ask(PlatformRequest::Permission(warning.action)),
+                move |ui: &mut Ui| ui.ask(PlatformRequest::Permission(action)),
             );
             setting_row(p, key, name, Some(description), control)
         })
         .collect();
     Some(section(p, "permissions", tr("Permissions needed"), rows))
+}
+
+/// The desktop's paste permission on GNOME and KDE Wayland until it is
+/// allowed, for people who skipped onboarding (#932).
+fn paste_permission(ui: &Ui, p: Paint) -> Option<El> {
+    let paste = ui
+        .platform
+        .paste
+        .filter(|paste| *paste != PasteAccess::Allowed)?;
+    let description = if paste == PasteAccess::Declined {
+        tr("Without it, Hex copies your words and you press Ctrl+V.")
+    } else {
+        tr("Hex only sends the paste keystroke. It never sees your screen.")
+    };
+    let control = permission_control(
+        p,
+        "permission-paste-allow",
+        if paste == PasteAccess::Asking {
+            PermissionControl::Waiting
+        } else {
+            PermissionControl::Allow
+        },
+        ButtonKind::Secondary,
+        super::paste_access::ask,
+    );
+    Some(setting_row(
+        p,
+        "permission-paste",
+        tr("Paste into apps"),
+        Some(description),
+        control,
+    ))
+}
+
+/// Records which untrusted permission rows are currently visible in the window
+/// so the macOS host clears retired Hex bundle IDs' stale TCC rows once in the
+/// background when a row appears.
+pub(super) fn update_shown_permissions(ui: &mut Ui) {
+    use crate::desktop::onboarding::PermissionState;
+    let visible = ui.window.as_ref().is_none_or(rune::AppHandle::is_visible);
+    let mut shown = Vec::new();
+    if visible && ui.platform.caps.permissions {
+        let setup_showing = ui.first_run.is_some()
+            || (ui.tour.is_none() && !ui.labs_open && ui.pane == Pane::General);
+        if setup_showing
+            && matches!(
+                ui.platform.permissions.accessibility,
+                PermissionState::NeedsRequest | PermissionState::NeedsSettings
+            )
+        {
+            shown.push(PermissionKind::Accessibility);
+        }
+        if ui.tour.is_none() && !ui.labs_open {
+            if ui.pane == Pane::Meetings
+                && super::meetings::available(ui)
+                && ui.meetings.view == super::meetings::View::Settings
+                && !ui.platform.system_audio
+            {
+                shown.push(PermissionKind::SystemAudio);
+            }
+            #[cfg(hex_capture)]
+            if ui.pane == Pane::Annotate
+                && ui.settings.capture.enabled
+                && ui
+                    .platform
+                    .scrawl
+                    .as_ref()
+                    .is_some_and(|view| !view.screen_recording && !view.screen_needs_restart)
+            {
+                shown.push(PermissionKind::ScreenRecording);
+            }
+        }
+    }
+    ui.platform.permissions_shown = shown;
+}
+
+/// Fixture setup for General's missing-permissions scenes (`waiting` vs `stale`).
+pub(super) fn mac_permissions_fixture(ui: &mut Ui, stale: bool) {
+    use crate::desktop::onboarding::PermissionState;
+    *ui = super::mac_fixture();
+    ui.platform.permissions.microphone = PermissionState::NeedsSettings;
+    ui.platform.permissions.accessibility = PermissionState::NeedsSettings;
+    if stale {
+        ui.platform.note_stale(PermissionKind::Accessibility);
+    } else {
+        ui.platform.note_asked(PermissionKind::Accessibility);
+    }
+    ui.platform.login_item = Some(crate::desktop::login_item::LoginItemStatus::RequiresApproval);
+    ui.platform.accessibility_renamed = true;
 }
 
 /// A save error where the OS has no listener card to show it in.
@@ -152,9 +261,22 @@ fn folder_label(ui: &Ui) -> String {
         .unwrap_or_else(|| folder.display().to_string())
 }
 
+/// Whether an organization turned OpenCode processing off.
+pub(super) fn opencode_managed() -> bool {
+    crate::policy::Policy::current().locks(crate::policy::Lock::OpenCodeProcessing)
+}
+
 /// The Meetings (beta) switch: the opt-in card's only row, and the first row
 /// of Meetings › Settings.
 pub(super) fn meetings_toggle(ui: &Ui, p: Paint) -> El {
+    if crate::labs::Feature::Meetings.managed().is_some() {
+        return super::controls::managed_row(
+            p,
+            "meetings-enabled",
+            Some(Pane::Meetings.icon()),
+            tr("Meetings (beta)"),
+        );
+    }
     icon_toggle_row(
         p,
         "meetings-enabled",
@@ -181,6 +303,7 @@ pub(super) fn meetings_settings(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> Vec<E
     // Only macOS asks before Hex may hear the other participants.
     if meetings.enabled && ui.platform.caps.permissions {
         let permitted = ui.platform.system_audio;
+        let stale = !permitted && ui.platform.stale(PermissionKind::SystemAudio);
         let system_audio = icon_row(
             p,
             "meeting-system-audio",
@@ -188,24 +311,27 @@ pub(super) fn meetings_settings(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> Vec<E
             tr("Screen & System Audio Recording"),
             Some(if permitted {
                 tr("Captures the other participants' audio")
+            } else if stale {
+                tr("An older Hex entry can keep this off")
             } else {
                 tr("Required to hear the other participants.")
             }),
             permission_control(
                 p,
                 "meeting-system-audio-allow",
-                if permitted {
-                    PermissionControl::Allowed
-                } else if ui.platform.asked(PermissionKind::SystemAudio) {
-                    PermissionControl::Waiting
-                } else {
-                    PermissionControl::Allow
-                },
+                ui.platform
+                    .control_for(PermissionKind::SystemAudio, permitted),
                 ButtonKind::Secondary,
-                |ui: &mut Ui| {
-                    // macOS prompts once; after that the switch is in
-                    // System Settings, with the guide beside it.
-                    ui.ask(PlatformRequest::SystemAudio);
+                move |ui: &mut Ui| {
+                    if stale {
+                        ui.ask(PlatformRequest::Permission(
+                            PermissionAction::ResetAndPrompt(PermissionKind::SystemAudio),
+                        ));
+                    } else {
+                        // macOS prompts once; after that the switch is in
+                        // System Settings, with the guide beside it.
+                        ui.ask(PlatformRequest::SystemAudio);
+                    }
                 },
             ),
         );
@@ -271,7 +397,15 @@ pub(super) fn meetings_settings(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> Vec<E
                 },
             ));
         }
-        more.push(icon_toggle_row(
+        more.push(if opencode_managed() {
+            super::controls::managed_row(
+                p,
+                "meeting-notes-opencode",
+                Some(&icons::SPARKLES),
+                tr("Summarize with OpenCode"),
+            )
+        } else {
+            icon_toggle_row(
             p,
             "meeting-notes-opencode",
             &icons::SPARKLES,
@@ -286,7 +420,8 @@ pub(super) fn meetings_settings(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> Vec<E
                 let enabled = !ui.settings.meetings.summarize_with_opencode;
                 ui.update(|settings| settings.meetings.summarize_with_opencode = enabled);
             },
-        ));
+        )
+        });
         if let Some(error) = &ui.platform.meeting_folder_error {
             // A failed folder change shows where it happened, opening the fold.
             more.push(note("meeting-folder-error", error, p.danger()));

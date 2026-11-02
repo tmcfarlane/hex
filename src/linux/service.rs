@@ -120,9 +120,67 @@ pub(crate) fn refresh_x_authority() {
     }
 }
 
+/// A service the user manager started before the desktop imported its
+/// environment has no display: Hyprland, for one, imports nothing into
+/// systemd unless its config runs `dbus-update-activation-environment`
+/// (#756). Adopts the user manager's current `WAYLAND_DISPLAY`, else the
+/// newest Wayland socket of this user's in `XDG_RUNTIME_DIR` that accepts a
+/// connection. Returns the display it adopted. Called on the main thread
+/// before Hex starts any other thread.
+pub(crate) fn adopt_wayland_display() -> Option<String> {
+    if custom_root() || graphical_session() {
+        return None;
+    }
+    let uid = unsafe { libc::getuid() };
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
+    let display = manager_environment("WAYLAND_DISPLAY")
+        .filter(|display| wayland_socket(&runtime.join(display), uid))
+        .or_else(|| newest_wayland_socket(&runtime, uid))?;
+    unsafe {
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+        std::env::set_var("WAYLAND_DISPLAY", &display);
+    }
+    Some(display)
+}
+
+/// The newest `wayland-*` socket in `runtime` that `uid` owns and that
+/// accepts a connection.
+fn newest_wayland_socket(runtime: &Path, uid: u32) -> Option<String> {
+    let mut sockets = fs::read_dir(runtime)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let metadata = entry.metadata().ok()?;
+            (name.starts_with("wayland-")
+                && !name.ends_with(".lock")
+                && metadata.file_type().is_socket()
+                && metadata.uid() == uid)
+                .then(|| (metadata.modified().ok(), name))
+        })
+        .collect::<Vec<_>>();
+    sockets.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    sockets
+        .into_iter()
+        .map(|(_, name)| name)
+        .find(|name| wayland_socket(&runtime.join(name), uid))
+}
+
+fn wayland_socket(path: &Path, uid: u32) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == uid)
+        && UnixStream::connect(path).is_ok()
+}
+
 /// A variable in the systemd user manager's environment, which the desktop
 /// session imports at each login.
 fn manager_environment(key: &str) -> Option<String> {
+    if custom_root() {
+        return None;
+    }
     let output = std::process::Command::new("systemctl")
         .args(["--user", "show-environment"])
         .stdin(std::process::Stdio::null())
@@ -464,6 +522,22 @@ pub(crate) fn capture_status() -> crate::control::ControlReply {
         .unwrap_or_else(|_| ControlReply::error("unavailable", "the listener didn't answer"))
 }
 
+/// Whether a Hex instance answers on the single-instance socket, whatever
+/// its protocol. A current Hex serves the socket only after its local API
+/// is up, so one that answers here while the local API doesn't is an older
+/// build an update left running (#915).
+pub(crate) fn instance_answers() -> bool {
+    let Ok(mut stream) = connect() else {
+        return false;
+    };
+    let message = Message {
+        version: VERSION,
+        request: Request::Status,
+    };
+    write_frame(&mut stream, &message).is_ok()
+        && read_frame::<serde_json::Value>(&mut stream).is_ok()
+}
+
 /// Sends one request to the running instance. Never starts one.
 pub(crate) fn request(request: Request) -> std::result::Result<Status, RequestError> {
     let reply = exchange(request, IO_TIMEOUT)?;
@@ -729,12 +803,9 @@ fn unit() -> String {
 
 /// Whether launches start Hex through its systemd user unit: the unit is
 /// installed (by the installer or Home Manager) and this process uses the
-/// default data root. `HEX_SYSTEMD_UNIT` names another unit, for isolated
-/// tests with a custom data root.
+/// default data root, or explicitly names an isolated test unit.
 pub(crate) fn supervised() -> bool {
-    if std::env::var_os("HEX_APPLICATION_SUPPORT_DIR").is_some()
-        && std::env::var_os("HEX_SYSTEMD_UNIT").is_none()
-    {
+    if custom_root() {
         return false;
     }
     Command::new("systemctl")
@@ -745,6 +816,14 @@ pub(crate) fn supervised() -> bool {
         .is_ok_and(|output| {
             output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "loaded"
         })
+}
+
+/// A custom data root uses only its supplied desktop environment, not the
+/// user's manager or discovered display sockets. `HEX_SYSTEMD_UNIT` opts an
+/// isolated test into a managed unit explicitly.
+fn custom_root() -> bool {
+    std::env::var_os("HEX_APPLICATION_SUPPORT_DIR").is_some()
+        && std::env::var_os("HEX_SYSTEMD_UNIT").is_none()
 }
 
 fn systemctl(arguments: &[&str]) -> Result<()> {

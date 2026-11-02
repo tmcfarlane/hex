@@ -15,6 +15,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+pub mod stats;
+
 const VERSION: u32 = 1;
 const MAX_ENTRIES: usize = 10_000;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -311,23 +313,31 @@ impl HistoryStore {
     }
 
     /// Delete one entry. Returns whether it existed.
+    /// A failed save keeps the entry, so the deletion can be retried.
     pub fn delete(&mut self, id: u64) -> io::Result<bool> {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.id != id);
-        if self.entries.len() == before {
+        let Some(index) = self.entries.iter().position(|entry| entry.id == id) else {
             return Ok(false);
+        };
+        let removed = self.entries.remove(index);
+        if let Err(error) = self.persist() {
+            self.entries.insert(index, removed);
+            return Err(error);
         }
-        self.persist()?;
         Ok(true)
     }
 
-    /// Delete every entry.
+    /// Delete every entry. A failed save keeps them, so the clear can be
+    /// retried.
     pub fn clear(&mut self) -> io::Result<()> {
-        if self.entries.is_empty() {
+        if self.entries.is_empty() && !self.prune_pending {
             return Ok(());
         }
-        self.entries.clear();
-        self.persist()
+        let entries = std::mem::take(&mut self.entries);
+        if let Err(error) = self.persist() {
+            self.entries = entries;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Change retention and immediately prune to the new window. Turning
@@ -372,6 +382,32 @@ impl HistoryStore {
             .filter(|entry| needle.is_empty() || entry.matches(&needle))
             .take(MAX_SEARCH_RESULTS)
             .collect()
+    }
+
+    /// The newest `count` entries within retention that a paste could
+    /// reuse: never a printed one or one with no text, as Paste Last.
+    /// Nothing while retention is Off.
+    pub fn recent(&self, count: usize, now_ms: u64) -> Vec<&HistoryEntry> {
+        if self.retention.is_off() {
+            return Vec::new();
+        }
+        let cutoff = self
+            .retention
+            .max_age_ms()
+            .map(|max_age| now_ms.saturating_sub(max_age));
+        self.entries()
+            .filter(|entry| cutoff.is_none_or(|cutoff| entry.timestamp_ms >= cutoff))
+            .filter(|entry| entry.kind != HistoryKind::Printed)
+            .filter(|entry| !entry.final_text.trim().is_empty())
+            .take(count)
+            .collect()
+    }
+
+    /// The idle worker's expiry: reread whatever another process wrote first,
+    /// so pruning never writes a stale copy over its records or deletions.
+    fn expire_shared(&mut self, now_ms: u64) {
+        self.sync();
+        self.expire(now_ms);
     }
 
     fn expire(&mut self, now_ms: u64) {
@@ -472,7 +508,7 @@ impl History {
                         Err(TryLockError::WouldBlock) => continue,
                         Err(TryLockError::Poisoned(error)) => error.into_inner(),
                     };
-                    store.expire(clock());
+                    store.expire_shared(clock());
                 }
             })
         {
@@ -513,6 +549,26 @@ impl History {
             .into_iter()
             .cloned()
             .collect()
+    }
+
+    /// The newest `count` reusable entries, newest first
+    /// ([`HistoryStore::recent`]).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn recent(&self, count: usize) -> Vec<HistoryEntry> {
+        self.synced()
+            .recent(count, now_ms())
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// The text entry `id` inserted, if it is still retained.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn final_text(&self, id: u64) -> Option<String> {
+        self.synced()
+            .entries()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.final_text.clone())
     }
 
     fn synced(&self) -> std::sync::MutexGuard<'_, HistoryStore> {
@@ -587,6 +643,33 @@ mod tests {
         window.sync();
         assert!(window.entry(first).is_none(), "a deletion is never undone");
         assert!(window.entry(second).is_some());
+    }
+
+    #[test]
+    fn expiry_in_a_stale_process_keeps_the_other_processes_writes() {
+        let path = temp_path("stale-expiry");
+        let day_ms = HistoryRetention::Day.max_age_ms().unwrap();
+        let mut listener = HistoryStore::open(path.clone(), HistoryRetention::Day, 0);
+        listener.record(draft("old"), 1_000).unwrap();
+        listener.record(draft("kept"), 2_000).unwrap();
+        let mut window = HistoryStore::open(path.clone(), HistoryRetention::Day, 2_000);
+        let newer = listener.record(draft("newer"), 3_000).unwrap().unwrap();
+
+        window.expire_shared(day_ms + 1_001);
+        let saved = read_snapshot(&path).unwrap();
+        let texts: Vec<_> = saved
+            .iter()
+            .map(|entry| entry.final_text.as_str())
+            .collect();
+        assert_eq!(texts, ["kept", "newer"]);
+        assert!(window.entry(newer).is_some());
+
+        window.clear().unwrap();
+        listener.expire_shared(day_ms + 2_001);
+        assert!(
+            read_snapshot(&path).unwrap().is_empty(),
+            "a clear stays cleared"
+        );
     }
 
     #[test]
@@ -869,6 +952,41 @@ mod tests {
     }
 
     #[test]
+    fn recent_lists_the_newest_reusable_entries_within_retention() {
+        let path = temp_path("recent");
+        let day_ms = HistoryRetention::Day.max_age_ms().unwrap();
+        let mut store = HistoryStore::open(path, HistoryRetention::Day, 0);
+        store.record(draft("expired"), 1_000).unwrap();
+        for (index, text) in ["one", "two", "  ", "three"].into_iter().enumerate() {
+            store.record(draft(text), day_ms + index as u64).unwrap();
+        }
+        store
+            .record(
+                HistoryDraft {
+                    kind: HistoryKind::Printed,
+                    ..draft("printed")
+                },
+                day_ms + 10,
+            )
+            .unwrap();
+        store.record(draft("four"), day_ms + 20).unwrap();
+
+        let texts = |store: &HistoryStore, count| {
+            store
+                .recent(count, day_ms + 1_001)
+                .into_iter()
+                .map(|entry| entry.final_text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&store, 5), ["four", "three", "two", "one"]);
+        assert_eq!(texts(&store, 2), ["four", "three"]);
+        store
+            .set_retention(HistoryRetention::Off, day_ms + 1_001)
+            .unwrap();
+        assert!(texts(&store, 5).is_empty(), "Off lists nothing");
+    }
+
+    #[test]
     fn clear_removes_everything_durably() {
         let path = temp_path("clear");
         let mut store = HistoryStore::open(path.clone(), HistoryRetention::Week, 0);
@@ -877,6 +995,27 @@ mod tests {
         store.clear().unwrap();
 
         assert_eq!(store.len(), 0);
+        let reopened = HistoryStore::open(path, HistoryRetention::Week, 3_000);
+        assert_eq!(reopened.len(), 0);
+    }
+
+    #[test]
+    fn failed_clear_and_delete_keep_entries_for_a_retry() {
+        let path = temp_path("failed-clear");
+        let mut store = HistoryStore::open(path.clone(), HistoryRetention::Week, 0);
+        let first = store.record(draft("one"), 1_000).unwrap().unwrap();
+        store.record(draft("two"), 2_000).unwrap();
+        let temporary = path.with_extension("json.tmp");
+        fs::create_dir(&temporary).unwrap();
+
+        assert!(store.delete(first).is_err());
+        assert!(store.clear().is_err());
+        assert_eq!(store.len(), 2, "a failed save keeps the entries");
+
+        fs::remove_dir(temporary).unwrap();
+        store.sync();
+        assert!(store.delete(first).unwrap());
+        store.clear().unwrap();
         let reopened = HistoryStore::open(path, HistoryRetention::Week, 3_000);
         assert_eq!(reopened.len(), 0);
     }

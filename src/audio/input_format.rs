@@ -5,7 +5,10 @@ use std::sync::mpsc::{self, Receiver};
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
+use cpal::{
+    BufferSize, Device, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
+    SupportedStreamConfig,
+};
 
 use super::{CaptureInstant, StreamErrorReporter, build_stream};
 
@@ -33,7 +36,12 @@ pub(super) fn start_stream_with_fallback(
     let supported = device
         .default_input_config()
         .wrap_err("could not read the input device configuration")?;
-    let error = match start_stream(device, &supported, default_name.clone()) {
+    let error = match start_stream(
+        device,
+        &supported,
+        BufferSize::Default,
+        default_name.clone(),
+    ) {
         Ok(started) => return Ok(started),
         Err(error) => error,
     };
@@ -42,12 +50,27 @@ pub(super) fn start_stream_with_fallback(
         device = %device_name,
         "the microphone refused its default format; trying the others it lists"
     );
+    // Some drivers refuse every format with the backend's default buffer
+    // (Intel Smart Sound answered E_INVALIDARG for each, #988) yet accept
+    // the same format with an explicit buffer duration, so each format is
+    // tried with explicit buffers too.
+    let mut candidates = fixed_buffer_sizes(supported.sample_rate(), supported.buffer_size())
+        .into_iter()
+        .map(|buffer| (supported, buffer))
+        .collect::<Vec<_>>();
     for candidate in alternative_input_configs(device, &supported) {
-        match start_stream(device, &candidate, default_name.clone()) {
+        candidates.push((candidate, BufferSize::Default));
+        for fixed in fixed_buffer_sizes(candidate.sample_rate(), candidate.buffer_size()) {
+            candidates.push((candidate, fixed));
+        }
+    }
+    for (candidate, buffer_size) in candidates {
+        match start_stream(device, &candidate, buffer_size, default_name.clone()) {
             Ok(started) => {
                 tracing::info!(
                     device = %device_name,
                     format = %describe_config(&candidate),
+                    buffer = ?buffer_size,
                     "opened the microphone in another format"
                 );
                 return Ok(started);
@@ -55,11 +78,32 @@ pub(super) fn start_stream_with_fallback(
             Err(error) => tracing::warn!(
                 error = format!("{error:#}"),
                 device = %device_name,
+                buffer = ?buffer_size,
                 "the microphone refused another format"
             ),
         }
     }
     Err(error)
+}
+
+/// Explicit buffers to try at `rate`: about 20 ms within the range the
+/// device reports, then 20 ms and 100 ms as they are. The reported range
+/// can top out at the device's short default period, which the Intel Smart
+/// Sound driver refuses in shared mode while it takes 20 ms or more (#988).
+fn fixed_buffer_sizes(rate: u32, reported: &SupportedBufferSize) -> Vec<BufferSize> {
+    let twenty_ms = (rate / 50).max(1);
+    let clamped = match *reported {
+        SupportedBufferSize::Range { min, max } if min <= max => twenty_ms.clamp(min, max),
+        _ => twenty_ms,
+    };
+    let mut sizes = Vec::with_capacity(3);
+    for frames in [clamped, twenty_ms, (rate / 10).max(1)] {
+        let size = BufferSize::Fixed(frames);
+        if !sizes.contains(&size) {
+            sizes.push(size);
+        }
+    }
+    sizes
 }
 
 fn is_supported_sample_format(format: SampleFormat) -> bool {
@@ -124,10 +168,12 @@ fn alternative_input_configs(
 fn start_stream(
     device: &Device,
     supported: &SupportedStreamConfig,
+    buffer_size: BufferSize,
     default_name: Option<String>,
 ) -> Result<StartedStream> {
     let sample_format = supported.sample_format();
-    let config: StreamConfig = (*supported).into();
+    let mut config: StreamConfig = (*supported).into();
+    config.buffer_size = buffer_size;
     let sample_rate = config.sample_rate;
     let channels = usize::from(config.channels);
     let (sender, chunks) = mpsc::channel();
@@ -197,4 +243,27 @@ fn start_stream(
         hex_microphone,
         sample_rate,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_buffers_go_past_a_short_reported_range() {
+        // A range that tops out at a 10 ms period still gets 20 ms and 100 ms.
+        let reported = SupportedBufferSize::Range { min: 144, max: 480 };
+        assert_eq!(
+            fixed_buffer_sizes(48_000, &reported),
+            vec![
+                BufferSize::Fixed(480),
+                BufferSize::Fixed(960),
+                BufferSize::Fixed(4_800),
+            ]
+        );
+        assert_eq!(
+            fixed_buffer_sizes(48_000, &SupportedBufferSize::Unknown),
+            vec![BufferSize::Fixed(960), BufferSize::Fixed(4_800)]
+        );
+    }
 }

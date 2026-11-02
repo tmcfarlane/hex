@@ -481,6 +481,10 @@ baselines. All 79 byte-changed renders were reviewed; none exceeded existing
 pixel tolerances. The four Buddy/Labs-link baselines were byte-unchanged.
 The five-second native Metal rehearsal and light/dark snapshots were reviewed.
 These are renderer and pure-policy checks, not microphone-to-field proof.
+After integrating the fork's newer `dev`, strict macOS Clippy and 114 focused
+checks passed again, including its microphone-buffer regression. That merge
+changed no Rune UI, HUD, shader, scene, or golden fixture sources; the Linux
+fixture proof above predates that integration.
 
 Prior visual-only implementation, observed November 2, 2026: the required Linux golden update run passed
 395 tests (3 ignored), followed by the same passing comparison with only the

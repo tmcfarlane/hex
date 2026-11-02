@@ -104,6 +104,7 @@ struct State {
 #[derive(Clone, Copy)]
 enum CaptureKind {
     Hotkey,
+    LiveHotkey,
     Programmatic,
 }
 
@@ -307,6 +308,10 @@ impl DictationAudio {
 
     pub fn start(&self, at: CaptureInstant) -> Result<bool> {
         self.start_capture(at, CaptureKind::Hotkey)
+    }
+
+    pub fn start_live(&self, at: CaptureInstant) -> Result<bool> {
+        self.start_capture(at, CaptureKind::LiveHotkey)
     }
 
     pub fn start_programmatic(&self, at: CaptureInstant) -> Result<()> {
@@ -1022,11 +1027,14 @@ impl Owner {
 
     fn start_capture_at(&mut self, kind: CaptureKind, at: CaptureInstant) {
         match kind {
-            CaptureKind::Hotkey => self.capture.start_at(at),
+            CaptureKind::Hotkey | CaptureKind::LiveHotkey => self.capture.start_at(at),
             CaptureKind::Programmatic => self.capture.start_programmatic_at(at),
         }
         // Only hotkey captures stream; programmatic ones need no speed-up.
-        self.stream_capture = matches!(kind, CaptureKind::Hotkey);
+        self.stream_capture = matches!(kind, CaptureKind::Hotkey | CaptureKind::LiveHotkey);
+        #[cfg(target_os = "macos")]
+        self.capture
+            .allow_live_insertion(matches!(kind, CaptureKind::LiveHotkey));
         self.keep_on_loss = matches!(kind, CaptureKind::Programmatic);
     }
 
@@ -1132,9 +1140,13 @@ mod tests {
     #[test]
     fn hotkey_captures_stream_once_intentional_and_others_do_not() {
         use crate::transcription::engine::Command as EngineCommand;
-        for kind in [CaptureKind::Hotkey, CaptureKind::Programmatic] {
+        for kind in [
+            CaptureKind::Hotkey,
+            CaptureKind::LiveHotkey,
+            CaptureKind::Programmatic,
+        ] {
             for cancel in [false, true] {
-                let hotkey = matches!(kind, CaptureKind::Hotkey);
+                let hotkey = matches!(kind, CaptureKind::Hotkey | CaptureKind::LiveHotkey);
                 let (engine, commands) = TranscriptionEngine::for_test();
                 let (mut owner, _input, _samples) = owner_for_test(true);
                 owner.engine = Some(Arc::new(engine));

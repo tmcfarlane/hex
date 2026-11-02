@@ -17,12 +17,15 @@ use objc2_foundation::{NSArray, NSData, NSString};
 use crate::keyboard;
 use crate::suppression::InputActivity;
 
+mod live;
+
 pub struct Paster {
     clipboard: Retained<NSPasteboard>,
     activity: InputActivity,
     continuation: Option<Continuation>,
     clipboard_restore: Arc<Mutex<ClipboardRestore>>,
     prepared_clipboard: Option<PreparedClipboard>,
+    live: live::Drafts,
 }
 
 #[derive(Clone, Copy)]
@@ -184,6 +187,7 @@ impl Paster {
             continuation: None,
             clipboard_restore: Arc::new(Mutex::new(ClipboardRestore::default())),
             prepared_clipboard: None,
+            live: live::Drafts::default(),
         }
     }
 
@@ -1166,6 +1170,7 @@ mod tests {
             }),
             clipboard_restore: Arc::new(Mutex::new(ClipboardRestore::default())),
             prepared_clipboard: None,
+            live: live::Drafts::default(),
         };
         let pending = paster.clipboard_restore.lock().unwrap().register(
             capture_clipboard(&clipboard).unwrap(),
@@ -1269,6 +1274,7 @@ mod tests {
             continuation: None,
             clipboard_restore: Arc::new(Mutex::new(ClipboardRestore::default())),
             prepared_clipboard: None,
+            live: live::Drafts::default(),
         };
         paster.prepare();
         let first_change_count = paster.prepared_clipboard.as_ref().unwrap().change_count;

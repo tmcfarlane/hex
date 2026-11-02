@@ -1,6 +1,6 @@
-//! The homepage character listens beside the HUD and sends visual words
-//! toward the caret. Partial words never insert text; final flights follow
-//! the normal paste. The Rune overlay passes every click through.
+//! The homepage character listens beside the HUD. The output worker inserts
+//! stable words; this click-through overlay flies only confirmed insertions
+//! to their measured slots. Tentative words stay beside the character.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +37,7 @@ struct Word {
     /// Which side the arc bows to.
     side: f32,
     tuning: Tuning,
-    speculative: bool,
+    live: bool,
 }
 
 #[derive(Default)]
@@ -52,7 +52,8 @@ pub(crate) struct Flights {
     recording: bool,
     jobs: BTreeSet<u64>,
     target: Option<ScreenRect>,
-    seen: usize,
+    capture: Option<u64>,
+    capture_job: Option<u64>,
     preview: String,
     until: f64,
     reduced: bool,
@@ -239,7 +240,7 @@ fn lay_out(launch: &Launch, now: f64) -> ([f32; 4], Vec<Word>) {
             start: now + index as f64 * launch.tuning.stagger_ms / 1000.0,
             side: if index % 2 == 0 { -1.0 } else { 1.0 },
             tuning: launch.tuning,
-            speculative: false,
+            live: false,
         })
         .collect();
     (rect, words)
@@ -262,7 +263,8 @@ impl Flights {
         self.recording = false;
         self.jobs.clear();
         self.target = None;
-        self.seen = 0;
+        self.capture = None;
+        self.capture_job = None;
         self.preview.clear();
         self.until = 0.0;
         self.level = 0.0;
@@ -295,15 +297,17 @@ impl Flights {
                 self.generation = generation;
                 self.recording = true;
                 self.target = None;
-                self.seen = 0;
+                self.capture = None;
+                self.capture_job = None;
                 self.preview.clear();
-                self.words.retain(|word| !word.speculative);
+                self.words.retain(|word| !word.live);
                 self.buddy = [anchor[0] - 55.0, anchor[1] + 35.0, 110.0, 110.0];
                 self.placement_pending = true;
             }
             BuddyEvent::Hud(HudEvent::Submitted { job_id }) if self.recording => {
                 self.recording = false;
                 self.jobs.insert(job_id);
+                self.capture_job = Some(job_id);
                 self.until = self.now + 1.0;
                 self.preview.clear();
             }
@@ -312,6 +316,9 @@ impl Flights {
                 | HudEvent::JobCancelled { job_id }
                 | HudEvent::JobFailed { job_id },
             ) => {
+                if self.capture_job == Some(job_id) {
+                    self.capture_job = None;
+                }
                 if self.jobs.remove(&job_id) {
                     self.until = self.now + 1.0;
                 }
@@ -319,61 +326,57 @@ impl Flights {
             BuddyEvent::Hud(HudEvent::Cancelled | HudEvent::Discarded | HudEvent::Failed) => {
                 self.recording = false;
                 self.target = None;
+                self.capture = None;
+                self.capture_job = None;
                 self.preview.clear();
-                self.words.retain(|word| !word.speculative);
+                self.words.retain(|word| !word.live);
                 self.until = 0.0;
             }
             BuddyEvent::Hud(HudEvent::Reset) => self.clear(),
             BuddyEvent::Target { generation, target } if generation == self.generation => {
-                if self.target != target {
-                    self.words.retain(|word| !word.speculative);
-                }
                 self.target = target;
             }
             BuddyEvent::Partial {
                 generation,
-                stable,
+                capture,
                 tentative,
-            } if generation == self.generation && self.recording => {
-                self.preview = if self.reduced || tentative.trim().is_empty() {
-                    tail(format!("{stable} {tentative}").trim(), 60)
-                } else {
-                    tail(&tentative, 60)
+            } if generation == self.generation
+                && self.recording
+                && self.capture.is_none_or(|current| current == capture) =>
+            {
+                self.capture = Some(capture);
+                self.preview = tail(tentative.trim(), 60);
+            }
+            BuddyEvent::Inserted { capture, words }
+                if self.capture == Some(capture)
+                    && (self.recording || self.capture_job.is_some())
+                    && !self.reduced =>
+            {
+                let from = self.mouth();
+                let tuning = Tuning {
+                    fade_ms: 120.0,
+                    glow: 0.2,
+                    land_push: 0.0,
+                    overshoot: 0.2,
+                    ..Tuning::default()
                 };
-                // Stable snapshots may revise their prefix. A position is emitted
-                // once; a shorter or corrected snapshot never replays old words.
-                let words: Vec<_> = stable.split_whitespace().collect();
-                let appended = words.iter().skip(self.seen).copied().collect::<Vec<_>>();
-                self.seen = self.seen.max(words.len());
-                if !self.reduced
-                    && let Some(target) = self.target
+                for (index, (word, rect)) in words
+                    .into_iter()
+                    .take(tuning.max_words)
+                    .filter(|(word, _)| !word.trim().is_empty() && word.chars().count() <= 64)
+                    .enumerate()
                 {
-                    let from = self.mouth();
-                    let (x, y) = target.center();
-                    let tuning = Tuning {
-                        fade_ms: 65.0,
-                        glow: 0.0,
-                        land_push: 0.0,
-                        overshoot: 0.0,
-                        ..Tuning::default()
-                    };
-                    for (index, word) in appended
-                        .into_iter()
-                        .take(tuning.max_words)
-                        .filter(|word| word.chars().count() <= 64)
-                        .enumerate()
-                    {
-                        self.words.push(Word {
-                            text: word.to_string(),
-                            from,
-                            to: [x as f32, y as f32],
-                            land: font_size(target.height),
-                            start: self.now + index as f64 * tuning.stagger_ms / 1000.0,
-                            side: if index % 2 == 0 { -1.0 } else { 1.0 },
-                            tuning,
-                            speculative: true,
-                        });
-                    }
+                    let (x, y) = rect.center();
+                    self.words.push(Word {
+                        text: word,
+                        from,
+                        to: [x as f32, y as f32],
+                        land: font_size(rect.height),
+                        start: self.now + index as f64 * tuning.stagger_ms / 1000.0,
+                        side: if index % 2 == 0 { -1.0 } else { 1.0 },
+                        tuning,
+                        live: true,
+                    });
                 }
             }
             _ => {}
@@ -488,7 +491,7 @@ fn poll(s: &mut Flights, now: f64, tx: &mut Tx) -> bool {
         let buddy = beside_hud(center, below_hud());
         if buddy != s.buddy {
             s.buddy = buddy;
-            s.words.retain(|word| !word.speculative);
+            s.words.retain(|word| !word.live);
         }
     }
     *MOUTH.lock().unwrap_or_else(|error| error.into_inner()) = active.then(|| s.mouth());
@@ -785,30 +788,89 @@ mod tests {
     }
 
     fn partial(s: &mut Flights, stable: &str) {
+        partial_for(s, 1, stable, "");
+    }
+
+    fn partial_for(s: &mut Flights, capture: u64, _stable: &str, tentative: &str) {
         s.handle(
             BuddyEvent::Partial {
-                generation: 1,
-                stable: stable.into(),
-                tentative: String::new(),
+                generation: s.generation,
+                capture,
+                tentative: tentative.into(),
             },
-            1,
+            s.generation,
+            [700.0, 20.0],
+        );
+    }
+
+    fn inserted(s: &mut Flights, capture: u64) {
+        s.handle(
+            BuddyEvent::Inserted {
+                capture,
+                words: launch().words,
+            },
+            s.generation,
             [700.0, 20.0],
         );
     }
 
     #[test]
-    fn corrected_stable_prefixes_and_duplicate_updates_never_replay() {
+    fn stable_prefixes_and_revisions_never_fly_before_insertion() {
         let mut s = listening();
         partial(&mut s, "one two");
-        assert_eq!(s.words.len(), 2);
         partial(&mut s, "one two");
         partial(&mut s, "won too");
         partial(&mut s, "won");
-        assert_eq!(s.words.len(), 2);
         partial(&mut s, "won too three");
-        assert_eq!(s.words.len(), 3);
-        assert_eq!(s.words[2].text, "three");
-        assert!(s.words.iter().all(|word| word.tuning.glow == 0.0));
+        assert!(s.words.is_empty());
+        assert_eq!(s.capture, Some(1));
+    }
+
+    #[test]
+    fn each_confirmed_word_flies_once_to_its_measured_slot() {
+        let mut s = listening();
+        partial_for(&mut s, 1, "so plan", "next");
+        inserted(&mut s, 1);
+        partial_for(&mut s, 1, "so plan", "next");
+        assert_eq!(s.words.len(), 2);
+        assert_eq!(s.words[0].text, "so");
+        assert_eq!(s.words[0].to, [207.0, 508.0]);
+        assert_eq!(s.words[1].text, "plan");
+        assert_eq!(s.words[1].to, [235.0, 508.0]);
+        assert!(s.words.iter().all(|word| word.live));
+        assert_eq!(s.preview, "next");
+    }
+
+    #[test]
+    fn a_new_capture_ignores_old_insertions_and_accepts_its_pending_insertions() {
+        let mut s = listening();
+        partial(&mut s, "so plan");
+        inserted(&mut s, 1);
+        s.handle(
+            BuddyEvent::Hud(HudEvent::Submitted { job_id: 10 }),
+            1,
+            [700.0, 20.0],
+        );
+        s.handle(BuddyEvent::Hud(HudEvent::Started), 2, [700.0, 20.0]);
+        inserted(&mut s, 1);
+        assert!(s.words.is_empty());
+        partial_for(&mut s, 2, "so plan", "");
+        inserted(&mut s, 1);
+        assert!(s.words.is_empty());
+        s.handle(
+            BuddyEvent::Hud(HudEvent::Submitted { job_id: 11 }),
+            2,
+            [700.0, 20.0],
+        );
+        inserted(&mut s, 2);
+        assert_eq!(s.words.len(), 2);
+        s.handle(
+            BuddyEvent::Hud(HudEvent::JobCompleted { job_id: 11 }),
+            2,
+            [700.0, 20.0],
+        );
+        inserted(&mut s, 2);
+        assert_eq!(s.words.len(), 2);
     }
 
     #[test]
@@ -841,25 +903,28 @@ mod tests {
         assert!(!s.active());
         assert!(s.words.is_empty() && s.pending.is_empty() && s.jobs.is_empty());
         assert!(s.preview.is_empty() && s.target.is_none());
+        assert!(s.capture.is_none() && s.capture_job.is_none());
     }
 
     #[test]
     fn reduced_motion_keeps_the_text_and_character_without_flights() {
         let mut s = listening();
         s.reduced = true;
-        partial(&mut s, "one two");
+        partial_for(&mut s, 1, "one two", "three");
+        inserted(&mut s, 1);
         s.pending.push(launch());
         s.advance(1.0, true, true);
         assert!(s.active());
         assert!(s.words.is_empty());
-        assert_eq!(s.preview, "one two");
+        assert_eq!(s.preview, "three");
         assert!(s.draw([1000, 800], 1.0).reduced);
     }
 
     #[test]
-    fn a_target_change_removes_words_bound_for_the_old_field() {
+    fn advancing_the_caret_keeps_confirmed_words_bound_to_their_inserted_slots() {
         let mut s = listening();
         partial(&mut s, "one two");
+        inserted(&mut s, 1);
         s.handle(
             BuddyEvent::Target {
                 generation: 1,
@@ -868,8 +933,12 @@ mod tests {
             1,
             [700.0, 20.0],
         );
-        assert!(s.words.is_empty());
+        assert_eq!(s.words.len(), 2);
+        assert_eq!(s.words[0].to, [207.0, 508.0]);
+        assert_eq!(s.words[1].to, [235.0, 508.0]);
         partial(&mut s, "one two three");
+        assert_eq!(s.words.len(), 2);
+        s.handle(BuddyEvent::Hud(HudEvent::Started), 2, [700.0, 20.0]);
         assert!(s.words.is_empty());
     }
 

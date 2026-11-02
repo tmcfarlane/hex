@@ -127,7 +127,7 @@ fn start_stream(
     default_name: Option<String>,
 ) -> Result<StartedStream> {
     let sample_format = supported.sample_format();
-    let config: StreamConfig = supported.clone().into();
+    let config: StreamConfig = (*supported).into();
     let sample_rate = config.sample_rate;
     let channels = usize::from(config.channels);
     let (sender, chunks) = mpsc::channel();

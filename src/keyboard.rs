@@ -235,27 +235,66 @@ pub fn post_command(character: char) -> Result<()> {
 pub fn type_text(text: &str) -> Result<()> {
     let mut events = Vec::new();
     for stroke in typing_strokes(text) {
-        match stroke {
-            Stroke::Text(units) => {
-                for down in [true, false] {
-                    let event = KeyboardEvent::new((0, down, 0))?;
-                    event.set_unicode(&units);
-                    events.push(event);
-                }
-            }
-            Stroke::LineBreak => {
-                for spec in
-                    shortcut_event_specs(RETURN_KEY_CODE, &[(SHIFT_FLAG, SHIFT_KEY_CODE)], 1)
-                {
-                    events.push(KeyboardEvent::new(spec)?);
-                }
-            }
-        }
+        events.extend(typing_events(stroke)?);
     }
     for event in events {
         event.post();
     }
     Ok(())
+}
+
+/// Stop between balanced strokes when the caller loses its text target.
+/// Only one bounded stroke's native events are prepared at a time.
+pub(crate) fn type_text_guarded(text: &str, allowed: &impl Fn() -> bool) -> Result<()> {
+    for stroke in typing_strokes_iter(text) {
+        if !allowed() {
+            return Err(eyre!("live typing is no longer allowed"));
+        }
+        post_balanced(typing_events(stroke)?, allowed, |event| event.post())?;
+    }
+    Ok(())
+}
+
+fn typing_events(stroke: Stroke) -> Result<Vec<KeyboardEvent>> {
+    match stroke {
+        Stroke::Text(units) => [true, false]
+            .into_iter()
+            .map(|down| {
+                let event = KeyboardEvent::new((0, down, 0))?;
+                event.set_unicode(&units);
+                Ok(event)
+            })
+            .collect(),
+        Stroke::LineBreak => {
+            shortcut_event_specs(RETURN_KEY_CODE, &[(SHIFT_FLAG, SHIFT_KEY_CODE)], 1)
+                .map(KeyboardEvent::new)
+                .collect()
+        }
+    }
+}
+
+fn post_balanced<T>(
+    events: impl IntoIterator<Item = T>,
+    allowed: &impl Fn() -> bool,
+    mut post: impl FnMut(T),
+) -> Result<()> {
+    if !allowed() {
+        return Err(eyre!("live typing is no longer allowed"));
+    }
+    // Once a press is delivered, its key and modifier releases must follow
+    // even if the target changes while this stroke is being posted.
+    for event in events {
+        post(event);
+    }
+    if !allowed() {
+        return Err(eyre!("live typing is no longer allowed"));
+    }
+    Ok(())
+}
+
+/// Caller must have verified a nonempty selection containing only its own text.
+pub(crate) fn delete_selected_text() -> Result<()> {
+    post_key_code(0x33, &[], 1)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -268,31 +307,34 @@ enum Stroke {
 /// the most one event carries, without splitting a surrogate pair. `\r\n`,
 /// `\n`, and `\r` each become one line break.
 fn typing_strokes(text: &str) -> Vec<Stroke> {
-    let mut strokes = Vec::new();
-    let mut units = Vec::new();
+    typing_strokes_iter(text).collect()
+}
+
+fn typing_strokes_iter(text: &str) -> impl Iterator<Item = Stroke> + '_ {
     let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        if matches!(character, '\r' | '\n') {
-            if character == '\r' {
-                characters.next_if_eq(&'\n');
+    std::iter::from_fn(move || {
+        let mut units = Vec::with_capacity(MAX_UNICODE_UNITS);
+        while let Some(&character) = characters.peek() {
+            if matches!(character, '\r' | '\n') {
+                if !units.is_empty() {
+                    break;
+                }
+                characters.next();
+                if character == '\r' {
+                    characters.next_if_eq(&'\n');
+                }
+                return Some(Stroke::LineBreak);
             }
-            if !units.is_empty() {
-                strokes.push(Stroke::Text(std::mem::take(&mut units)));
+            let mut encoded = [0; 2];
+            let encoded = character.encode_utf16(&mut encoded);
+            if units.len() + encoded.len() > MAX_UNICODE_UNITS {
+                break;
             }
-            strokes.push(Stroke::LineBreak);
-            continue;
+            characters.next();
+            units.extend_from_slice(encoded);
         }
-        let mut encoded = [0; 2];
-        let encoded = character.encode_utf16(&mut encoded);
-        if units.len() + encoded.len() > MAX_UNICODE_UNITS {
-            strokes.push(Stroke::Text(std::mem::take(&mut units)));
-        }
-        units.extend_from_slice(encoded);
-    }
-    if !units.is_empty() {
-        strokes.push(Stroke::Text(units));
-    }
-    strokes
+        (!units.is_empty()).then_some(Stroke::Text(units))
+    })
 }
 
 /// One press of a key that types nothing, under the modifier `flags` held
@@ -454,6 +496,41 @@ mod tests {
     const OPTION_FLAG: u64 = 1 << 19;
     const CONTROL_KEY_CODE: u16 = 59;
     const CONTROL_FLAG: u64 = 1 << 18;
+
+    #[test]
+    fn guarded_typing_never_posts_a_stroke_after_target_loss() {
+        let mut posted = Vec::new();
+        assert!(post_balanced([1, 2], &|| false, |event| posted.push(event)).is_err());
+        assert!(posted.is_empty());
+    }
+
+    #[test]
+    fn target_loss_after_a_press_still_releases_its_key_and_modifiers() {
+        use std::cell::Cell;
+        for specs in [
+            vec![(0, true, 0), (0, false, 0)],
+            shortcut_event_specs(RETURN_KEY_CODE, &[(SHIFT_FLAG, SHIFT_KEY_CODE)], 1).collect(),
+        ] {
+            let allowed = Cell::new(true);
+            let mut posted = Vec::new();
+            assert!(
+                post_balanced(specs.clone(), &|| allowed.get(), |event| {
+                    posted.push(event);
+                    allowed.set(false);
+                })
+                .is_err()
+            );
+            assert_eq!(posted, specs);
+            let before = posted.len();
+            assert!(
+                post_balanced([(0, true, 0), (0, false, 0)], &|| allowed.get(), |event| {
+                    posted.push(event)
+                })
+                .is_err()
+            );
+            assert_eq!(posted.len(), before);
+        }
+    }
 
     /// Hex's taps let its own keystrokes through by this mark, so a posted
     /// shortcut (the capture hand-off's ⌘V included) never reads as the

@@ -44,7 +44,7 @@ fn poll(s: &mut Flights, time: f64, tx: &mut Tx) -> bool {
     let was_active = s.active();
     let had_words = !s.words.is_empty();
     let previous_step = s.fixture_step;
-    let now = time + 1.6;
+    let now = time;
     s.now = now;
     if s.fixture_step == 0 {
         s.handle(BuddyEvent::Hud(HudEvent::Started), 1, [155.0, 35.0]);
@@ -64,13 +64,25 @@ fn poll(s: &mut Flights, time: f64, tx: &mut Tx) -> bool {
         s.fixture_step = 1;
     }
     let words: Vec<_> = LINE.split_whitespace().collect();
+    let landings = landings(&words);
     for count in 1..=words.len() {
-        if now >= 0.9 + count as f64 * 0.45 && s.fixture_step <= count {
+        if now >= 0.2 + count as f64 * 0.45 && s.fixture_step <= count {
+            let stable = words[..count].join(" ");
             s.handle(
                 BuddyEvent::Partial {
                     generation: 1,
-                    stable: words[..count].join(" "),
+                    capture: 1,
                     tentative: words.get(count).unwrap_or(&"").to_string(),
+                },
+                1,
+                [155.0, 35.0],
+            );
+            s.fixture_field = TextEdit::new(stable);
+            s.fixture_field.focused = true;
+            s.handle(
+                BuddyEvent::Inserted {
+                    capture: 1,
+                    words: vec![landings[count - 1].clone()],
                 },
                 1,
                 [155.0, 35.0],
@@ -78,38 +90,15 @@ fn poll(s: &mut Flights, time: f64, tx: &mut Tx) -> bool {
             s.fixture_step = count + 1;
         }
     }
-    if now >= 3.8 && s.fixture_step == words.len() + 1 {
+    if now >= 3.1 && s.fixture_step == words.len() + 1 {
         s.handle(
             BuddyEvent::Hud(HudEvent::Submitted { job_id: 1 }),
             1,
             [155.0, 35.0],
         );
-        s.fixture_field = TextEdit::new(LINE);
-        s.fixture_field.focused = true;
-        let font = rune_theme_opencode::kit(true).ty.ui_compact;
-        let mut x = 296.0;
-        let landings = words
-            .iter()
-            .map(|word| {
-                let width = rune::text::measure(word, &[], font, None).0;
-                let rect = ScreenRect {
-                    x,
-                    y: 237.0,
-                    width: width as f64,
-                    height: 16.0,
-                };
-                x += width as f64 + rune::text::measure(" ", &[], font, None).0 as f64;
-                (word.to_string(), rect)
-            })
-            .collect();
-        s.pending.push(Launch {
-            from: s.mouth(),
-            words: landings,
-            tuning: Tuning::default(),
-        });
         s.fixture_step += 1;
     }
-    if now >= 4.3 && s.fixture_step == words.len() + 2 {
+    if now >= 3.5 && s.fixture_step == words.len() + 2 {
         s.handle(
             BuddyEvent::Hud(HudEvent::JobCompleted { job_id: 1 }),
             1,
@@ -131,6 +120,26 @@ fn poll(s: &mut Flights, time: f64, tx: &mut Tx) -> bool {
     had_words || !s.words.is_empty() || active != was_active || previous_step != s.fixture_step
 }
 
+fn landings(words: &[&str]) -> Vec<(String, ScreenRect)> {
+    let font = rune_theme_opencode::kit(true).ty.ui_compact;
+    let space = rune::text::measure(" ", &[], font, None).0 as f64;
+    let mut x = 296.0;
+    words
+        .iter()
+        .map(|word| {
+            let width = rune::text::measure(word, &[], font, None).0 as f64;
+            let rect = ScreenRect {
+                x,
+                y: 237.0,
+                width,
+                height: 16.0,
+            };
+            x += width + space;
+            (word.to_string(), rect)
+        })
+        .collect()
+}
+
 pub(super) fn field(s: &Flights, p: Paint) -> El {
     col()
         .key("destination")
@@ -145,4 +154,44 @@ pub(super) fn field(s: &Flights, p: Paint) -> El {
                 .key("draft-field")
                 .w_full(),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_real_field_grows_by_word_and_release_does_not_replay_it() {
+        let mut s = Flights::default();
+        fixture(&mut s);
+        poll(&mut s, 0.0, &mut Tx::default());
+        assert!(s.fixture_field.text.is_empty() && s.words.is_empty());
+        let words: Vec<_> = LINE.split_whitespace().collect();
+        for count in 1..=words.len() {
+            poll(&mut s, 0.21 + count as f64 * 0.45, &mut Tx::default());
+            assert_eq!(s.fixture_field.text, words[..count].join(" "));
+            assert_eq!(s.words.last().unwrap().text, words[count - 1]);
+        }
+        poll(&mut s, 3.11, &mut Tx::default());
+        assert_eq!(s.fixture_field.text, LINE);
+        assert!(!s.recording && s.pending.is_empty());
+        assert!(s.words.is_empty());
+        poll(&mut s, 3.51, &mut Tx::default());
+        assert_eq!(s.fixture_field.text, LINE);
+        assert!(s.jobs.is_empty() && s.words.is_empty());
+        poll(&mut s, 4.7, &mut Tx::default());
+        assert_eq!(s.fixture_field.text, LINE);
+        assert!(!s.active() && s.pending.is_empty() && s.words.is_empty());
+    }
+
+    #[test]
+    fn reduced_motion_still_updates_the_real_field() {
+        let mut s = Flights::default();
+        fixture(&mut s);
+        s.reduced = true;
+        poll(&mut s, 0.66, &mut Tx::default());
+        assert_eq!(s.fixture_field.text, "Words");
+        assert_eq!(s.preview, "go");
+        assert!(s.words.is_empty() && s.active());
+    }
 }

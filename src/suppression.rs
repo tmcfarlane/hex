@@ -285,15 +285,24 @@ impl Drop for PendingInputAcknowledgement<'_> {
 }
 
 #[derive(Clone, Default)]
-pub struct InputActivity(Arc<AtomicU64>);
+pub struct InputActivity {
+    revision: Arc<AtomicU64>,
+    physical: Arc<AtomicU64>,
+}
 
 impl InputActivity {
     pub fn revision(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
+        self.revision.load(Ordering::Acquire)
     }
 
     pub fn invalidate(&self) {
-        self.0.fetch_add(1, Ordering::AcqRel);
+        self.revision.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Physical edits and clicks, excluding title/context changes that a live
+    /// insertion can itself cause in the same focused field.
+    pub(crate) fn physical_revision(&self) -> u64 {
+        self.physical.load(Ordering::Acquire)
     }
 
     fn observe(&self, input: InputEvent, suppressed: bool) {
@@ -304,7 +313,15 @@ impl InputActivity {
             )
         {
             self.invalidate();
+            self.physical.fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    fn observe_shortcut_input(&self, input: InputEvent, suppressed: bool, hotkeys: RuntimeHotkeys) {
+        let globe_companion = matches!(input, InputEvent::Key { code, .. }
+            if is_own_globe_key(code, hotkeys.dictation)
+                || hotkeys.second_dictation.is_some_and(|binding| is_own_globe_key(code, binding)));
+        self.observe(input, suppressed || globe_companion);
     }
 }
 
@@ -1093,13 +1110,16 @@ unsafe extern "C" fn event_callback(
         .shortcut_suppression
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let hotkeys = crate::app_settings::runtime_hotkeys();
     let suppress = suppression.process_all(
         input,
-        crate::app_settings::runtime_hotkeys(),
+        hotkeys,
         delivered,
         context.takes_escape.load(Ordering::Acquire),
     );
-    context.activity.observe(input, suppress);
+    context
+        .activity
+        .observe_shortcut_input(input, suppress, hotkeys);
     // A key Hex consumed (its shortcuts, Escape) was never the app's chord.
     #[cfg(hex_capture)]
     if let Some(key) = capture_key
@@ -3171,6 +3191,41 @@ mod tests {
             );
             assert_eq!(activity.revision(), revision + 3);
         }
+    }
+
+    #[test]
+    fn own_globe_companions_preserve_both_activity_revisions() {
+        let globe = InputEvent::Key {
+            code: GLOBE_KEY_CODE,
+            down: true,
+            flags: FUNCTION_KEY_MASK,
+        };
+        for second in [false, true] {
+            let activity = InputActivity::default();
+            let mut hotkeys = RuntimeHotkeys {
+                dictation: option_binding(),
+                ..RuntimeHotkeys::default()
+            };
+            if second {
+                hotkeys.second_dictation = Some(function_binding());
+            } else {
+                hotkeys.dictation = function_binding();
+            }
+            activity.observe_shortcut_input(globe, false, hotkeys);
+            assert_eq!(activity.revision(), 0);
+            assert_eq!(activity.physical_revision(), 0);
+        }
+        let activity = InputActivity::default();
+        activity.observe_shortcut_input(
+            globe,
+            false,
+            RuntimeHotkeys {
+                dictation: option_binding(),
+                ..RuntimeHotkeys::default()
+            },
+        );
+        assert_eq!(activity.revision(), 1);
+        assert_eq!(activity.physical_revision(), 1);
     }
 
     #[test]
@@ -6070,6 +6125,18 @@ mod tests {
         activity.invalidate();
 
         assert_ne!(activity.revision(), revision);
+        assert_eq!(activity.physical_revision(), 0);
+    }
+
+    #[test]
+    fn live_input_revision_ignores_context_and_suppressed_shortcuts_but_tracks_edits() {
+        let activity = InputActivity::default();
+        activity.invalidate();
+        activity.observe(InputEvent::MouseDown, true);
+        assert_eq!(activity.physical_revision(), 0);
+        activity.observe(InputEvent::MouseDown, false);
+        assert_eq!(activity.physical_revision(), 1);
+        assert_eq!(activity.revision(), 2);
     }
 
     fn both_options() -> RuntimeHotkey {

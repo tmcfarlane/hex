@@ -122,7 +122,7 @@ enum Job {
     },
 }
 
-/// Observation only: neither these events nor the live words write text.
+/// Visual observations. The output worker reports words only after insertion.
 pub(crate) enum BuddyEvent {
     Hud(HudEvent),
     Target {
@@ -131,8 +131,12 @@ pub(crate) enum BuddyEvent {
     },
     Partial {
         generation: u64,
-        stable: String,
+        capture: u64,
         tentative: String,
+    },
+    Inserted {
+        capture: u64,
+        words: Vec<(String, ScreenRect)>,
     },
 }
 
@@ -148,7 +152,7 @@ pub(crate) fn generation() -> u64 {
 
 pub(crate) fn on_event(observe: impl Fn(BuddyEvent) + Send + Sync + 'static) {
     let _ = OBSERVER.set(Box::new(observe));
-    crate::dictation::live_text::watch(|partial| {
+    crate::dictation::live_text::watch_capture(|capture, partial| {
         let Some(partial) =
             partial.filter(|_| crate::labs::words_to_caret() && !accessibility::secure_input())
         else {
@@ -160,12 +164,24 @@ pub(crate) fn on_event(observe: impl Fn(BuddyEvent) + Send + Sync + 'static) {
         if let Some(observe) = OBSERVER.get() {
             observe(BuddyEvent::Partial {
                 generation: generation(),
-                stable: partial.stable.clone(),
+                capture,
                 tentative: partial.tentative.clone(),
             });
         }
         request_target();
     });
+}
+
+/// A stable word was confirmed in its focused field. No Accessibility work or
+/// text mutation runs on this visual notification path.
+pub(crate) fn inserted(capture: u64, words: Vec<(String, ScreenRect)>) {
+    if !words.is_empty()
+        && crate::labs::words_to_caret()
+        && !accessibility::secure_input()
+        && let Some(observe) = OBSERVER.get()
+    {
+        observe(BuddyEvent::Inserted { capture, words });
+    }
 }
 
 /// Called on the HUD's reporting path. All Accessibility work is queued.
@@ -210,13 +226,15 @@ pub(crate) fn on_launch(launch: impl Fn(Launch) + Send + Sync + 'static) {
 
 /// `text` was just pasted. Never waits; a busy thread drops the flight.
 pub(crate) fn pasted(text: &str) {
-    if crate::labs::words_to_caret() && LAUNCH.get().is_some() && !text.trim().is_empty() {
-        if let Some(pid) = crate::dictation::context::frontmost_pid() {
-            send(Job::Pasted {
-                pid,
-                text: text.to_string(),
-            });
-        }
+    if crate::labs::words_to_caret()
+        && LAUNCH.get().is_some()
+        && !text.trim().is_empty()
+        && let Some(pid) = crate::dictation::context::frontmost_pid()
+    {
+        send(Job::Pasted {
+            pid,
+            text: text.to_string(),
+        });
     }
 }
 

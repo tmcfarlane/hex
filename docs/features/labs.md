@@ -412,33 +412,77 @@ key remains `labs.words_to_caret`; enable it with `hex labs on words-to-caret`.
 ```ts
 Labs › Hex buddy on                       // dictate.hex-buddy
 ├── Dictation starts -> native character appears near the HUD; microphone level moves its mouth
-├── Streaming text changes
-│   ├── Newly stable words -> fly from its mouth toward the real caret when available
-│   └── Latest tentative phrase -> preview beside its mouth
-│       Provisional visuals only: never inserted, copied, or retained
-├── Successful paste -> final words fly to their own pasted text bounds
-│   └── Text bounds unavailable or focus changes -> skip the flight
-├── CPU or a model without streaming -> microphone reaction during capture; final words only
-├── Failed or cancelled output -> no successful final flight
-├── Reduce Motion -> quiet still character and text; no flight
-└── Toggle off -> hide promptly and stop Accessibility reads
+├── Eligible physical-hotkey capture in the app -> stable words enter the focused field live
+│   ├── Newly appended stable words -> insert one word at a time; confirm actual text
+│   │   └── Measured word bounds -> one flight per confirmed insertion
+│   ├── Tentative phrase -> preview beside the mouth only
+│   └── Release -> final processing replaces only the unchanged region this capture owns
+│       └── No second complete paste or replayed flight batch
+├── Cursor/focus moves, user edits, or confirmation fails after a live write
+│   └── Stop changing the field; final transcript remains in History and Paste Last
+├── Cancel -> remove only the still-owned, unchanged live text; otherwise leave it in place
+├── Copy Only, CLI print output, programmatic/service capture -> no live insertion
+├── No live edit began (CPU, nonstreaming, unsupported field) -> usual final output
+│   └── Successful paste -> final flight when geometry is available
+├── Reduce Motion -> quiet still character; actual live insertion continues without flight
+└── Toggle off -> hide promptly and stop live editing and Accessibility reads
 ```
 
-The character and words use a click-through Rune overlay: they never take
-focus, alter capture boundaries, delay insertion, or touch the clipboard.
-Target lookup is bounded and rejects secure input, password fields, and
-geometry outside the focused window. Final animation observes successful
-insertion; it does not insert provisional text. [Dictation feedback](dictation.md#hex-buddy)
+This is the explicit opt-in exception to final-only dictation output. Ordinary
+Labs › Live text remains display only, with its own independent switch. Buddy
+requests streaming partials even when that line is off. Live insertion needs
+a streaming model/device and an editable, focused Accessibility text field with
+an empty selection. Secure input, password fields, unsupported metadata, and
+geometry outside the focused window are rejected. Stable-prefix revisions wait
+for final correction rather than replaying words.
+
+The character and words use a click-through Rune overlay that never takes
+focus. The output worker owns field edits and validates the foreground app,
+focused control, selection, and exact inserted text before each change. Once a
+write has happened or its result is uncertain, ownership loss never triggers a
+second complete paste elsewhere. Final processing may correct only the owned
+region, while surrounding text remains intact. Animation observes confirmed
+insertions and skips unavailable word geometry. [Dictation feedback](dictation.md#hex-buddy)
 links this to the normal press-to-paste flow.
 
 Sources: [native hand-off and target lookup](../../src/words_to_caret.rs),
+[live output policy](../../src/paste/live.rs),
+[owned Accessibility editing](../../src/accessibility/live.rs),
 [overlay and motion](../../src/rune_ui/words_to_caret.rs),
 [Accessibility geometry](../../src/accessibility.rs), and
 [partial publication](../../src/dictation/live_text.rs).
 Checks include `words_to_caret_is_its_own_bit_and_off_by_default`,
 `words_to_caret_reaches_every_build_on_macos`, and
 `all_switches_fit_below_the_idle_minutes` in [labs.rs](../../src/labs.rs).
-Observed November 2, 2026: the required Linux golden update run passed
+Available live-edit checks include `final_text_replaces_only_the_owned_prefix_once`,
+`moved_cursor_or_edited_prefix_is_never_replaced_or_rolled_back`,
+`unsupported_metadata_permits_fallback_before_any_write`,
+`an_uncertain_write_stays_touched_and_never_overwrites_again`, and
+`an_existing_selection_is_never_touched` in
+[accessibility/live.rs](../../src/accessibility/live.rs). The overlay checks
+`stable_prefixes_and_revisions_never_fly_before_insertion`,
+`each_confirmed_word_flies_once_to_its_measured_slot`, and
+`a_new_capture_ignores_old_insertions_and_accepts_its_pending_insertions`;
+the scripted [preview checks](../../src/rune_ui/words_to_caret/preview.rs) cover
+the real Rune field growing by word and remaining intact on release, including
+Reduce Motion. The output inbox also checks cancellation, bounded coalescing,
+and final recovery in [parakeet/live_output.rs](../../src/parakeet/live_output.rs).
+Guarded keyboard delivery and physical-input revisions have checks for balanced
+releases, title/context changes, and Fn/Globe shortcut companions.
+
+Live insertion, observed November 2, 2026: strict macOS Clippy passed for the
+binary and tests; 113 focused checks and the separate Fn/Globe companion check
+passed. The broader macOS run passed 390 checks, with the same pre-existing
+meeting-capsule `call-ended-light` mismatch (4,629 pixels) as the earlier run.
+Linux strict binary Clippy and 15 shared live-text checks passed (1 opt-in
+snapshot ignored). Required Linux golden regeneration passed 395 tests
+(3 ignored), followed by the same passing comparison against the retained
+baselines. All 79 byte-changed renders were reviewed; none exceeded existing
+pixel tolerances. The four Buddy/Labs-link baselines were byte-unchanged.
+The five-second native Metal rehearsal and light/dark snapshots were reviewed.
+These are renderer and pure-policy checks, not microphone-to-field proof.
+
+Prior visual-only implementation, observed November 2, 2026: the required Linux golden update run passed
 395 tests (3 ignored), followed by the same passing comparison with only the
 four reviewed Buddy/Labs-link images updated. This used Rust 1.99.1 on ARM64
 Linux with Mesa 25 lavapipe in an isolated container. The `mac-labs-buddy`
@@ -448,7 +492,11 @@ The focused macOS behavior, paste, and shader checks passed (34 tests).
 The broader macOS Rune UI run had 348 passing checks and one unchanged
 meeting-capsule `call-ended-light` golden mismatch. Native microphone, caret
 targeting, click-through/focus, multiple displays, and OS Reduce Motion still
-need end-to-end observation. The rehearsal does not exercise those paths.
+need end-to-end observation. That evidence predates live insertion. The updated
+five-second rehearsal types a real Rune `TextInput` word by word and exercises
+the confirmed-flight path, but does not exercise native Accessibility editing.
+No native end-to-end live insertion, cursor/user-edit interruption, or final
+owned-region correction has been observed yet.
 
 Use your own speech model (`custom-models`) graduated: adding a model file
 and models found on this computer are always on now
@@ -679,9 +727,11 @@ vocabulary list itself (rewriting and search), and Linux's Terminal paste.
   taskbar rather than under the pill (#797; not yet observed on Windows).
   Its toggle
   is `labs.live_text` (off by default), asked as each dictation starts. The
-  gate, `labs::live_text()`, is where the work starts: with it off, the engine gives a hotkey capture's
-  live stream no partial slot and never reads the model's text between
-  feeds, and no host adds the line's overlay. Each dictation's `finished
+  gate, `labs::live_text()`, controls this display-only line; it never inserts
+  text into another app. With it off, no host adds the line's overlay. If
+  neither another partial consumer nor macOS Hex buddy needs text, the engine
+  gives a hotkey capture's live stream no partial slot and never reads the
+  model's text between feeds. Each dictation's `finished
   live stream` line in process.log counts its text changes (`partials`);
   `RUST_LOG=hex=debug` adds a `live text` line per change with the audio
   fed and the word counts, never the words. Checks:

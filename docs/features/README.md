@@ -36,8 +36,9 @@ Local transcription picker (#645); its Benchmark details toggle (off by
 default) shows each model's raw WER or CER with its language, dataset, source,
 and conditions (#647).
 On macOS, [Hex buddy](labs.md#hex-buddy) adds the homepage character beside the
-dictation HUD, with words flying toward the text cursor; it is off by default
-and still needs native verification.
+dictation HUD and inserts stable words live during eligible physical-hotkey
+dictation, with confirmed words flying to their text slots. It is off by
+default; native editing and end-to-end verification are still pending.
 General › Advanced › Interface language offers Português (Brasil), and Hex
 uses it for any Portuguese system language (#867); it also offers Français,
 used for any French system language (#892). Neither has had a native

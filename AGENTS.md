@@ -39,7 +39,7 @@ dev-channel builds only; a stable build never lists, accepts, or runs it).
 A feature with its own pane joins the sidebar as a normal item while
 on and is hidden while off; a behaviour-only feature is just its toggle. Today:
 Meetings (beta), Voice Filter (locked on while its macOS driver is
-installed), Playground, Live text, Live chapters, Vocabulary biasing, Switch
+installed), Playground, Live text, Hex buddy (macOS), Live chapters, Vocabulary biasing, Switch
 model with keyboard language (#216), Mouse shortcuts (#209, macOS), Also
 pause the browser (#301, macOS), Share dictation shortcut (#176, Windows),
 Unload model when idle (#442), and Terminal paste (Windows). Externally contributed features land there too.
@@ -734,8 +734,17 @@ CoreAudio formats, AppleScript details, or event serialization.
   receives the capture's 16 kHz audio with each pause cut to its first 2.5 s
   and last 0.3 s (Parakeet drops words after pauses past its left context),
   the finish always carries the complete clip, and a failed, empty, overfed, late, or interrupted stream
-  falls back to the whole clip. Nothing pastes or reaches the focused app
-  before the final text. With Labs › Live text on, a hotkey capture's
+  falls back to the whole clip. Normal output reaches the focused app only
+  after final text. The explicit exception is macOS Labs › Hex buddy
+  (`labs.words_to_caret`, off by default): eligible physical-hotkey app output
+  may insert newly appended stable words live, never tentative words. Copy
+  Only, CLI print output, and programmatic/service captures do not live insert.
+  Live editing owns only its confirmed text region; final processing may replace
+  that region only while focus, selection, input activity, and exact text still
+  verify. Cursor movement, user edits, or an uncertain write stop automatic
+  changes; never recover by pasting a second full transcript after a live write.
+  The final transcript remains available through History and Paste Last.
+  With Labs › Live text on, a hotkey capture's
   stream publishes its provisional text for Hex's own HUD only; it is never
   pasted, copied, or kept in History or Paste Last. One engine thread runs every inference because a live
   stream holds the model's compute lease. Streams run only on GPU devices

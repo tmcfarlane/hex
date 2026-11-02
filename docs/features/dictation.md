@@ -673,7 +673,9 @@ Model advertises streaming, GPU device             // dictate.streaming
        └── Model switched during the capture -> Stream closed -> Whole clip
   Short tap, chord discard, microphone failure -> Drop the stream
   Voice-delimited and programmatic captures (macOS) -> Whole clip after release
-  Nothing is pasted or reaches the focused app until the final text exists
+  Normal output reaches the focused app only after the final text exists
+  macOS Labs › Hex buddy -> Eligible physical-hotkey output may insert stable words live
+    // explicit opt-in; owned text only; see dictate.hex-buddy below
   Labs + labs.live_text -> After each feed the stream publishes its text   // dictate.live-text
   ├── Stable (committed) and tentative text, per capture; a new capture starts empty
   ├── One click-through line just past the HUD, on the HUD's screen
@@ -1303,17 +1305,24 @@ fullscreen app on a notched Mac is not yet observed.
 
 On macOS, Labs › Hex buddy (`labs.words_to_caret`, off by default) shows the
 homepage character near the HUD while recording. Its mouth follows the
-microphone; newly stable streaming words fly toward the real text caret when
-available, and the latest tentative phrase previews near its mouth. These are
-provisional visuals only: the usual final output is what gets pasted.
-After a successful paste, final words fly to their own pasted bounds, falling
-back to the caret or text field and skipping the flight when no target exists.
-CPU or nonstreaming capture has the character's microphone reaction and final
-words only. Reduce Motion keeps a quiet still character with text and no flight.
-Turning the feature off hides it and stops target reads promptly; failed and
-cancelled output never produces a successful final flight. See the
+microphone. In the app's eligible physical-hotkey capture, newly appended stable
+words enter the focused editable field live. Confirmed insertions fly to their
+measured text slots; tentative words stay beside the character. Ordinary
+Labs › Live text remains display only. Copy Only, CLI print output, and
+programmatic/service captures do not live insert.
+
+Release finalizes the complete transcript and applies processing, then replaces
+only the unchanged text this capture owns. It does not paste or fly a duplicate
+batch. Moving the cursor, changing focus, editing the live text, or losing
+confirmation stops automatic changes after a live write; the final transcript
+remains available through History and Paste Last. Cancellation removes live
+text only while ownership still verifies. If no live edit began, including CPU,
+nonstreaming, or unsupported fields, normal final output and its successful-paste
+flight remain. Reduce Motion keeps a quiet still character and actual field
+insertion without flights. Turning the feature off hides it and stops live
+editing/target reads promptly. See the
 [Hex buddy contract and proof limits](labs.md#hex-buddy) (`dictate.hex-buddy`) for
-source references; native verification is pending.
+source references and available checks; native live-edit verification is pending.
 
 ### Dot scope
 

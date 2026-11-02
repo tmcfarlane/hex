@@ -1,6 +1,9 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 
+mod live;
+pub(crate) use live::LiveInsertion;
+
 type CfTypeRef = *const c_void;
 type CfStringRef = *const c_void;
 type AxUiElementRef = *const c_void;

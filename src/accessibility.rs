@@ -7,8 +7,8 @@ type AxUiElementRef = *const c_void;
 
 const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const MESSAGING_TIMEOUT_SECS: f32 = 0.25;
-/// Each call while finding the caret for Labs › Words to cursor, which runs
-/// just before a paste: a slow app loses its flight, never the paste's time.
+/// Each call while finding Hex buddy's target. The caller also supplies an
+/// overall deadline and admission check, tested before each query.
 const CARET_TIMEOUT_SECS: f32 = 0.05;
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -131,122 +131,163 @@ pub fn secure_input() -> bool {
     unsafe { IsSecureEventInputEnabled() }
 }
 
-/// Where the frontmost app's insertion point is. `None` in a password
-/// field, when nothing editable has focus, or when what the app reports
-/// isn't believable (a collapsed Chromium rect, or one outside the focused
-/// window): better no flight than one to the wrong place. Each
-/// Accessibility call is bounded by 50 ms.
-pub fn caret_target(pid: i32) -> Option<CaretTarget> {
-    let (focused, window) = focused_text(pid)?;
-    let by_range = copy_range(&focused, c"AXSelectedTextRange").and_then(|selection| {
-        copy_bounds_for_range(
-            &focused,
-            CfRange {
-                location: selection.location + selection.length,
-                length: 0,
-            },
-        )
-    });
-    let rect = by_range
-        .filter(|rect| plausible_caret(*rect, window))
-        .or_else(|| {
-            // Chromium and Electron only answer with text markers.
-            let markers = copy_attribute(&focused, c"AXSelectedTextMarkerRange")?;
-            copy_parameterized_rect(&focused, c"AXBoundsForTextMarkerRange", &markers)
-                .filter(|rect| plausible_caret(*rect, window))
-        });
-    if let Some(rect) = rect {
-        return Some(CaretTarget::Caret(rect));
-    }
-    let role = copy_string(&focused, c"AXRole");
-    if !matches!(
-        role.as_deref(),
-        Some("AXTextField" | "AXTextArea" | "AXComboBox" | "AXSearchField")
-    ) {
+/// A focused control retained on the animation worker. Reading a later
+/// result through this snapshot cannot silently switch to another field.
+pub(crate) struct CaretFocus {
+    pid: i32,
+    application: CfObject,
+    focused: CfObject,
+    window: CfObject,
+}
+
+/// Retains the current field and window, unless it is a password field.
+/// `allowed` carries the caller's deadline, Labs, focus, and secure-input
+/// checks; a query in progress can exceed its deadline by at most one AX
+/// messaging timeout.
+pub(crate) fn caret_focus(pid: i32, allowed: &impl Fn() -> bool) -> Option<CaretFocus> {
+    let read = CaretRead { allowed };
+    let application = read.application(pid)?;
+    let focused = read.element(&application, c"AXFocusedUIElement")?;
+    if read.string(&focused, c"AXSubrole").as_deref() == Some("AXSecureTextField") {
         return None;
     }
-    element_frame(&focused)
-        .filter(|frame| plausible_field(*frame, window))
-        .map(CaretTarget::Field)
+    let window = read.element(&application, c"AXFocusedWindow")?;
+    allowed().then_some(CaretFocus {
+        pid,
+        application,
+        focused,
+        window,
+    })
+}
+
+impl CaretFocus {
+    /// Whether this exact control still has focus in the same app.
+    pub(crate) fn is_current(&self, pid: i32, allowed: &impl Fn() -> bool) -> bool {
+        if pid != self.pid {
+            return false;
+        }
+        let read = CaretRead { allowed };
+        let Some(current) = read.attribute(&self.application, c"AXFocusedUIElement") else {
+            return false;
+        };
+        // SAFETY: Both values are retained AXUIElements.
+        let same = unsafe { CFEqual(current.0, self.focused.0) != 0 };
+        same && read.string(&self.focused, c"AXSubrole").as_deref() != Some("AXSecureTextField")
+            && allowed()
+    }
+
+    /// The insertion point or field frame, excluding collapsed, off-window,
+    /// and secure fields. Each read uses the same admission check.
+    pub(crate) fn target(&self, allowed: &impl Fn() -> bool) -> Option<CaretTarget> {
+        let read = CaretRead { allowed };
+        if read.string(&self.focused, c"AXSubrole").as_deref() == Some("AXSecureTextField") {
+            return None;
+        }
+        let window = read.frame(&self.window)?;
+        let by_range = read
+            .range(&self.focused, c"AXSelectedTextRange")
+            .and_then(|selection| {
+                if selection.location < 0 || selection.length < 0 {
+                    return None;
+                }
+                read.bounds(
+                    &self.focused,
+                    CfRange {
+                        location: selection.location.checked_add(selection.length)?,
+                        length: 0,
+                    },
+                )
+            });
+        let rect = by_range
+            .filter(|rect| plausible_caret(*rect, window))
+            .or_else(|| {
+                // Chromium and Electron may answer only with text markers.
+                let markers = read.attribute(&self.focused, c"AXSelectedTextMarkerRange")?;
+                read.parameterized_rect(&self.focused, c"AXBoundsForTextMarkerRange", &markers)
+                    .filter(|rect| plausible_caret(*rect, window))
+            });
+        if let Some(rect) = rect {
+            return allowed().then_some(CaretTarget::Caret(rect));
+        }
+        let role = read.string(&self.focused, c"AXRole");
+        if !matches!(
+            role.as_deref(),
+            Some("AXTextField" | "AXTextArea" | "AXComboBox" | "AXSearchField")
+        ) {
+            return None;
+        }
+        read.frame(&self.focused)
+            .filter(|frame| plausible_field(*frame, window) && allowed())
+            .map(CaretTarget::Field)
+    }
+
+    /// Finds the pasted words in this retained field. A lost admission
+    /// drops the complete flight, including bounds read before it changed.
+    pub(crate) fn words(
+        &self,
+        text: &str,
+        limit: usize,
+        allowed: &impl Fn() -> bool,
+    ) -> Option<Vec<Option<ScreenRect>>> {
+        let body = text.trim_start();
+        let units = isize::try_from(body.encode_utf16().count()).ok()?;
+        if units == 0 {
+            return None;
+        }
+        let read = CaretRead { allowed };
+        if read.string(&self.focused, c"AXSubrole").as_deref() == Some("AXSecureTextField") {
+            return None;
+        }
+        let window = read.frame(&self.window)?;
+        let selection = read.range(&self.focused, c"AXSelectedTextRange")?;
+        let start = selection.location.checked_sub(units)?;
+        if selection.length != 0 || start < 0 {
+            return None;
+        }
+        let found = read.string_for_range(
+            &self.focused,
+            CfRange {
+                location: start,
+                length: units,
+            },
+        )?;
+        if !found.split_whitespace().eq(body.split_whitespace()) {
+            return None;
+        }
+        let mut rects = Vec::new();
+        for (offset, units) in utf16_words(&found).take(limit) {
+            let rect = read.bounds(
+                &self.focused,
+                CfRange {
+                    location: start.checked_add(offset)?,
+                    length: units,
+                },
+            );
+            if !allowed() {
+                return None;
+            }
+            rects.push(rect.filter(|rect| plausible_word(*rect, window)));
+        }
+        allowed().then_some(rects)
+    }
 }
 
 /// Asks Chromium and Electron apps to build their accessibility tree, which
 /// they keep asleep until an assistive app asks, so it's ready by the time a
 /// dictation pastes. Other apps ignore it.
-pub fn wake_text_markers(pid: i32) {
-    // SAFETY: AXUIElementCreateApplication returns a retained Core Foundation object.
-    let Some(application) = bounded_element(
-        unsafe { AXUIElementCreateApplication(pid) },
-        CARET_TIMEOUT_SECS,
-    ) else {
+pub fn wake_text_markers(pid: i32, allowed: &impl Fn() -> bool) {
+    let read = CaretRead { allowed };
+    let Some(application) = read.application(pid) else {
         return;
     };
     let Some(attribute) = cf_string_literal(c"AXManualAccessibility") else {
         return;
     };
     let attribute = CfObject(attribute);
-    // SAFETY: both are valid Core Foundation objects; kCFBooleanTrue is a constant.
-    unsafe { AXUIElementSetAttributeValue(application.0, attribute.0, kCFBooleanTrue) };
-}
-
-/// Where each of `text`'s first `limit` words sits on screen, once the
-/// frontmost app shows it pasted: `None` until the text just before the
-/// cursor reads as `text`, word for word, and for each word whose rect
-/// isn't believable.
-pub fn pasted_words(pid: i32, text: &str, limit: usize) -> Option<Vec<Option<ScreenRect>>> {
-    let body = text.trim_start();
-    let units = body.encode_utf16().count() as isize;
-    if units == 0 {
-        return None;
+    if allowed() {
+        // SAFETY: Both are valid Core Foundation objects; kCFBooleanTrue is a constant.
+        unsafe { AXUIElementSetAttributeValue(application.0, attribute.0, kCFBooleanTrue) };
     }
-    let (focused, window) = focused_text(pid)?;
-    let selection = copy_range(&focused, c"AXSelectedTextRange")?;
-    let start = selection.location - units;
-    if selection.length != 0 || start < 0 {
-        return None;
-    }
-    let found = copy_string_for_range(
-        &focused,
-        CfRange {
-            location: start,
-            length: units,
-        },
-    )?;
-    if !found.split_whitespace().eq(body.split_whitespace()) {
-        return None;
-    }
-    Some(
-        utf16_words(&found)
-            .take(limit)
-            .map(|(offset, units)| {
-                copy_bounds_for_range(
-                    &focused,
-                    CfRange {
-                        location: start + offset,
-                        length: units,
-                    },
-                )
-                .filter(|rect| plausible_word(*rect, window))
-            })
-            .collect(),
-    )
-}
-
-/// The frontmost app's focused element, unless it's a password field, and
-/// its focused window's frame.
-fn focused_text(pid: i32) -> Option<(CfObject, ScreenRect)> {
-    // SAFETY: AXUIElementCreateApplication returns a retained Core Foundation object.
-    let application = bounded_element(
-        unsafe { AXUIElementCreateApplication(pid) },
-        CARET_TIMEOUT_SECS,
-    )?;
-    let focused = copy_element(&application, c"AXFocusedUIElement", CARET_TIMEOUT_SECS)?;
-    if copy_string(&focused, c"AXSubrole").as_deref() == Some("AXSecureTextField") {
-        return None;
-    }
-    let window = copy_element(&application, c"AXFocusedWindow", CARET_TIMEOUT_SECS)
-        .and_then(|window| element_frame(&window))?;
-    Some((focused, window))
 }
 
 /// Each whitespace-separated word's offset and length in UTF-16 units.
@@ -534,72 +575,134 @@ fn copy_element(element: &CfObject, name: &CStr, timeout: f32) -> Option<CfObjec
     (unsafe { AXUIElementSetMessagingTimeout(child.0, timeout) } == 0).then_some(child)
 }
 
-/// An element's `AXPosition` and `AXSize`.
-fn element_frame(element: &CfObject) -> Option<ScreenRect> {
-    let mut origin = [0.0_f64; 2];
-    let mut size = [0.0_f64; 2];
-    copy_ax_value(element, c"AXPosition", AX_VALUE_CG_POINT, &mut origin)?;
-    copy_ax_value(element, c"AXSize", AX_VALUE_CG_SIZE, &mut size)?;
-    Some(ScreenRect {
-        x: origin[0],
-        y: origin[1],
-        width: size[0],
-        height: size[1],
-    })
+/// Every AX call for a flight goes through its current admission check.
+struct CaretRead<'a> {
+    allowed: &'a dyn Fn() -> bool,
 }
 
-/// Reads an `AXValue` attribute of `value_type` into `out`, which has its
-/// layout (two `f64`s for a point or a size).
-fn copy_ax_value(
-    element: &CfObject,
-    name: &CStr,
-    value_type: u32,
-    out: &mut [f64; 2],
-) -> Option<()> {
-    let value = copy_attribute(element, name)?;
-    ax_value_into(&value, value_type, out.as_mut_ptr().cast())
-}
-
-fn ax_value_into(value: &CfObject, value_type: u32, out: *mut c_void) -> Option<()> {
-    if unsafe { CFGetTypeID(value.0) } != unsafe { AXValueGetTypeID() } {
-        return None;
+impl CaretRead<'_> {
+    fn call<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
+        (self.allowed)().then(read)
     }
-    // SAFETY: `value` is an AXValue and the caller's `out` has the layout of `value_type`.
-    unsafe { AXValueGetValue(value.0, value_type, out) }.then_some(())
-}
 
-fn copy_bounds_for_range(element: &CfObject, range: CfRange) -> Option<ScreenRect> {
-    // SAFETY: AXValueCreate copies the CFRange and returns a retained object.
-    let parameter = unsafe { AXValueCreate(AX_VALUE_CF_RANGE, (&range as *const CfRange).cast()) };
-    if parameter.is_null() {
-        return None;
+    fn application(&self, pid: i32) -> Option<CfObject> {
+        // SAFETY: Create rule returns a retained element.
+        let value = self.call(|| unsafe { AXUIElementCreateApplication(pid) })?;
+        if value.is_null() {
+            return None;
+        }
+        self.bounded(CfObject(value))
     }
-    let parameter = CfObject(parameter);
-    copy_parameterized_rect(element, c"AXBoundsForRange", &parameter)
-}
 
-fn copy_parameterized_rect(
-    element: &CfObject,
-    name: &CStr,
-    parameter: &CfObject,
-) -> Option<ScreenRect> {
-    let attribute = CfObject(cf_string_literal(name)?);
-    let mut value = ptr::null();
-    let status = unsafe {
-        AXUIElementCopyParameterizedAttributeValue(element.0, attribute.0, parameter.0, &mut value)
-    };
-    if status != 0 || value.is_null() {
-        return None;
+    fn bounded(&self, element: CfObject) -> Option<CfObject> {
+        // SAFETY: `element` is retained for the call.
+        (self.call(|| unsafe { AXUIElementSetMessagingTimeout(element.0, CARET_TIMEOUT_SECS) })?
+            == 0)
+            .then_some(element)
     }
-    let value = CfObject(value);
-    let mut rect = [0.0_f64; 4];
-    ax_value_into(&value, AX_VALUE_CG_RECT, rect.as_mut_ptr().cast())?;
-    Some(ScreenRect {
-        x: rect[0],
-        y: rect[1],
-        width: rect[2],
-        height: rect[3],
-    })
+
+    fn attribute(&self, element: &CfObject, name: &CStr) -> Option<CfObject> {
+        self.call(|| copy_attribute(element, name))?
+    }
+
+    fn element(&self, element: &CfObject, name: &CStr) -> Option<CfObject> {
+        self.bounded(self.attribute(element, name)?)
+    }
+
+    fn string(&self, element: &CfObject, name: &CStr) -> Option<String> {
+        cf_string(self.attribute(element, name)?.0)
+    }
+
+    fn value(&self, value: &CfObject, kind: u32, out: *mut c_void) -> Option<()> {
+        // SAFETY: The type ID query has no side effects.
+        if unsafe { CFGetTypeID(value.0) } != self.call(|| unsafe { AXValueGetTypeID() })? {
+            return None;
+        }
+        // SAFETY: Callers supply storage with the layout of `kind`.
+        self.call(|| unsafe { AXValueGetValue(value.0, kind, out) })?
+            .then_some(())
+    }
+
+    fn range(&self, element: &CfObject, name: &CStr) -> Option<CfRange> {
+        let value = self.attribute(element, name)?;
+        let mut range = CfRange::default();
+        self.value(
+            &value,
+            AX_VALUE_CF_RANGE,
+            (&mut range as *mut CfRange).cast(),
+        )?;
+        Some(range)
+    }
+
+    fn frame(&self, element: &CfObject) -> Option<ScreenRect> {
+        let mut origin = [0.0_f64; 2];
+        let mut size = [0.0_f64; 2];
+        let position = self.attribute(element, c"AXPosition")?;
+        self.value(&position, AX_VALUE_CG_POINT, origin.as_mut_ptr().cast())?;
+        let dimensions = self.attribute(element, c"AXSize")?;
+        self.value(&dimensions, AX_VALUE_CG_SIZE, size.as_mut_ptr().cast())?;
+        Some(ScreenRect {
+            x: origin[0],
+            y: origin[1],
+            width: size[0],
+            height: size[1],
+        })
+    }
+
+    fn range_parameter(&self, range: CfRange) -> Option<CfObject> {
+        // SAFETY: AXValueCreate copies the CFRange and returns a retained value.
+        let value = self.call(|| unsafe {
+            AXValueCreate(AX_VALUE_CF_RANGE, (&range as *const CfRange).cast())
+        })?;
+        (!value.is_null()).then(|| CfObject(value))
+    }
+
+    fn parameterized(
+        &self,
+        element: &CfObject,
+        name: &CStr,
+        parameter: &CfObject,
+    ) -> Option<CfObject> {
+        let attribute = CfObject(cf_string_literal(name)?);
+        let mut value = ptr::null();
+        // SAFETY: Each argument remains retained for this call.
+        let status = self.call(|| unsafe {
+            AXUIElementCopyParameterizedAttributeValue(
+                element.0,
+                attribute.0,
+                parameter.0,
+                &mut value,
+            )
+        })?;
+        (status == 0 && !value.is_null()).then(|| CfObject(value))
+    }
+
+    fn parameterized_rect(
+        &self,
+        element: &CfObject,
+        name: &CStr,
+        parameter: &CfObject,
+    ) -> Option<ScreenRect> {
+        let value = self.parameterized(element, name, parameter)?;
+        let mut rect = [0.0_f64; 4];
+        self.value(&value, AX_VALUE_CG_RECT, rect.as_mut_ptr().cast())?;
+        Some(ScreenRect {
+            x: rect[0],
+            y: rect[1],
+            width: rect[2],
+            height: rect[3],
+        })
+    }
+
+    fn bounds(&self, element: &CfObject, range: CfRange) -> Option<ScreenRect> {
+        self.parameterized_rect(element, c"AXBoundsForRange", &self.range_parameter(range)?)
+    }
+
+    fn string_for_range(&self, element: &CfObject, range: CfRange) -> Option<String> {
+        let value =
+            self.parameterized(element, c"AXStringForRange", &self.range_parameter(range)?)?;
+        cf_string(value.0).filter(|text| !text.is_empty())
+    }
 }
 
 fn copy_string(element: &CfObject, name: &CStr) -> Option<String> {
@@ -659,8 +762,7 @@ mod tests {
         assert_eq!(focused_window_title(i32::MAX), None);
         assert_eq!(focused_web_url(i32::MAX), None);
         assert_eq!(char_before_caret(i32::MAX), None);
-        assert_eq!(caret_target(i32::MAX), None);
-        assert_eq!(pasted_words(i32::MAX, "so the plan", 14), None);
+        assert!(caret_focus(i32::MAX, &|| true).is_none());
     }
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> ScreenRect {

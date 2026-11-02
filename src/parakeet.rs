@@ -528,7 +528,6 @@ fn run_output_worker(
     while let Ok(job) = jobs.recv() {
         if matches!(job, OutputJob::PreparePaste) {
             paster.prepare();
-            crate::words_to_caret::wake();
             continue;
         }
         for job in ordered.push(job) {
@@ -972,11 +971,7 @@ fn finish_output(
                             } else {
                                 PasteMode::Continue
                             };
-                            paste(&completed.text, mode, &commit).inspect(|()| {
-                                if !matches!(mode, PasteMode::CopyOnly) {
-                                    crate::words_to_caret::pasted(&completed.text);
-                                }
-                            })
+                            paste(&completed.text, mode, &commit)
                         }
                         TranscriptionTarget::Service
                         | TranscriptionTarget::Print
@@ -1041,7 +1036,6 @@ fn finish_output(
                     .and_then(|text| {
                         paste(text, PasteMode::Continue, &|| true)
                             .map_err(|error| error.to_string())?;
-                        crate::words_to_caret::pasted(text);
                         Ok(text.to_string())
                     }),
                 PasteKind::MeetingDelta => {

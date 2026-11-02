@@ -11,7 +11,7 @@ debug, local `HEX_LOCAL_BUILD`, test `HEX_TEST_BUILD`, and dev-channel
 drops it, its gate reads false even when `settings.json` says on, and the
 saved setting is kept untouched. In dev builds a Dev row carries a quiet
 "Dev" tag, and `hex labs` prints each feature's audience. Every feature
-below is `Everyone` except Words to cursor, which is `Dev`. There is no master switch. **Labs** is always the last item in the
+below is `Everyone` today. There is no master switch. **Labs** is always the last item in the
 sidebar and lists every Labs feature as one flat row (name, one-line
 description, toggle), each **off by default**, plus Send feedback and Run
 setup again.
@@ -52,7 +52,7 @@ Feature             Pane  Toggle (settings.json, hex settings)   On: what it doe
 ├── Skip long pauses no    labs.skip_pauses             (Linux, Windows) a whole-clip dictation run hears only the head and tail of each long pause (#899)
 ├── Stop when the call ends no labs.stop_when_call_ends (macOS) a recording Hex started on its own stops 30 s after its call app leaves the microphone and goes quiet (#835)
 ├── Fix results in Output no labs.output_fixes           Output's Try card offers Vocabulary and Fix this, which copies an agent prompt naming the wrong result (#989)
-├── Words to cursor no    labs.words_to_caret          (macOS, Dev) a pasted dictation's words fly from the HUD to where they landed
+├── Hex buddy       no    labs.words_to_caret          (macOS) the homepage character speaks your words toward the text cursor
 └── Terminal paste  no    paste_with_shift             (Windows) paste with Ctrl+Shift+V (#477/#478; Linux keeps it in General)
 
 Settings › Labs                          // labs.page
@@ -403,45 +403,44 @@ Checks: `benchmark_details_show_raw_rates_and_mark_unknowns`,
 rendered with the toggle on; there is no `--snap` scene for it, and the Labs
 page goldens need regenerating on Linux with the new row.
 
-Words to cursor (`words-to-caret`, macOS, Dev builds only): while on, a pasted dictation's
-first 14 words fly from the HUD's plate to where they landed in the focused
-app, one after another, and glow over the real text as they fade.
+<a id="hex-buddy"></a>
+
+Hex buddy (`words-to-caret`, macOS, `Everyone`, off by default) brings the
+homepage character beside the dictation HUD. Its persisted and `hex settings`
+key remains `labs.words_to_caret`; enable it with `hex labs on words-to-caret`.
 
 ```ts
-Dictation pastes (Paste or Raw paste, not Copy dictation only; Paste last dictation too)
-├── paste returns Ok -> words_to_caret::pasted(text)   // never waits; a busy thread drops the flight
-└── words-to-caret thread                            // each AX call bounded by 50 ms
-    ├── secure input on, or a password field -> no flight
-    ├── the text before the cursor reads as the dictation within wait_ms (250)
-    │   -> each word flies to its own AXBoundsForRange rect; a word without a believable rect stays put
-    ├── never reads that way -> every word flies into the caret
-    │   (AXBoundsForRange at the cursor, else Chromium's AXBoundsForTextMarkerRange)
-    ├── no believable caret, focus is a text field -> into the field near its leading edge
-    └── nothing -> no flight; never an AXWindow, never a rect outside the focused window
-Dictation starts -> AXManualAccessibility on the frontmost app (Chromium and Electron wake their tree)
-Reduce Motion -> the overlay draws nothing
+Labs › Hex buddy on                       // dictate.hex-buddy
+├── Dictation starts -> native character appears near the HUD; microphone level moves its mouth
+├── Streaming text changes
+│   ├── Newly stable words -> fly from its mouth toward the real caret when available
+│   └── Latest tentative phrase -> preview beside its mouth
+│       Provisional visuals only: never inserted, copied, or retained
+├── Successful paste -> final words fly to their own pasted text bounds
+│   └── Text bounds unavailable or focus changes -> skip the flight
+├── CPU or a model without streaming -> microphone reaction during capture; final words only
+├── Failed or cancelled output -> no successful final flight
+├── Reduce Motion -> quiet still character and text; no flight
+└── Toggle off -> hide promptly and stop Accessibility reads
 ```
 
-The gate, `labs::words_to_caret()`, is read where the work starts (the
-paste's hand-off and the dictation-start wake); off, no thread starts and no
-Accessibility call is made. The flight is a click-through Rune overlay above
-the status bar (`rune_ui::words_to_caret`), placed over just the HUD, the
-landing rects, and room for the arcs, and hidden once every word is gone; it
-never takes focus or a click and never touches the clipboard. A caret is
-believable when it's 4-200 points tall, at most 40 wide, and inside the
-focused window (Chromium's unanswered `(0, screen height, 0, 0)` is not).
-The timings are knobs in `~/.config/hex/words-to-caret.json`, read as each
-flight launches: `duration_ms` (300), `stagger_ms` (28), `bend` (0.16),
-`overshoot` (0.9), `launch_size` (15), `land_push` (10), `land_hz` (8.5),
-`land_damping` (0.55), `fade_ms` (260), `glow` (0.6), `max_words` (14),
-`wait_ms` (250).
-Checks: `only_a_believable_caret_inside_the_window_counts` and
-`words_are_counted_in_utf16_units` in
-[accessibility.rs](../../src/accessibility.rs); the fallbacks and tuning in
-[words_to_caret.rs](../../src/words_to_caret.rs); layout and motion in
-[rune_ui/words_to_caret.rs](../../src/rune_ui/words_to_caret.rs);
-`words_to_caret_is_its_own_bit_and_off_by_default` in
-[labs.rs](../../src/labs.rs). The overlay has no golden scene.
+The character and words use a click-through Rune overlay: they never take
+focus, alter capture boundaries, delay insertion, or touch the clipboard.
+Target lookup is bounded and rejects secure input, password fields, and
+geometry outside the focused window. Final animation observes successful
+insertion; it does not insert provisional text. [Dictation feedback](dictation.md#hex-buddy)
+links this to the normal press-to-paste flow.
+
+Sources: [native hand-off and target lookup](../../src/words_to_caret.rs),
+[overlay and motion](../../src/rune_ui/words_to_caret.rs),
+[Accessibility geometry](../../src/accessibility.rs), and
+[partial publication](../../src/dictation/live_text.rs).
+Checks include `words_to_caret_is_its_own_bit_and_off_by_default`,
+`words_to_caret_reaches_every_build_on_macos`, and
+`all_switches_fit_below_the_idle_minutes` in [labs.rs](../../src/labs.rs).
+Pure behavior checks and Linux golden regeneration are planned for this change;
+native microphone, caret targeting, focus, multi-display placement, and Reduce
+Motion verification remain pending. The overlay has no standard golden scene.
 
 Use your own speech model (`custom-models`) graduated: adding a model file
 and models found on this computer are always on now
@@ -804,7 +803,8 @@ Checks: `labs_is_one_flat_list_of_toggles_off_by_default`,
 [panes.rs](../../src/rune_ui/tests/panes.rs);
 `every_feature_is_off_by_default_and_round_trips` and
 `the_old_master_switch_is_read_and_ignored` in [labs.rs](../../src/labs.rs);
-`a_dev_feature_in_a_stable_build_is_unlisted_refused_and_off` in [labs.rs](../../src/labs.rs) (a stand-in for a Dev feature) and `words_to_caret_runs_only_in_dev_builds`; `labs_parse_as_a_read_command` in [main.rs](../../src/main.rs);
+`a_dev_feature_in_a_stable_build_is_unlisted_refused_and_off` in [labs.rs](../../src/labs.rs)
+(a stand-in for a Dev feature); `labs_parse_as_a_read_command` in [main.rs](../../src/main.rs);
 `status_reads_for_a_person` and
 `status_reports_labs_and_reads_older_replies_without_it` in
 [control/cli.rs](../../src/control/cli.rs);

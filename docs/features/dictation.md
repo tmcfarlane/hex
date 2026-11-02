@@ -1299,6 +1299,22 @@ and normal Spaces keep their position. Check: `scripts/check
 dictation::indicator::tests::top_capsule` covers the math only; placement over a
 fullscreen app on a notched Mac is not yet observed.
 
+### Hex buddy
+
+On macOS, Labs › Hex buddy (`labs.words_to_caret`, off by default) shows the
+homepage character near the HUD while recording. Its mouth follows the
+microphone; newly stable streaming words fly toward the real text caret when
+available, and the latest tentative phrase previews near its mouth. These are
+provisional visuals only: the usual final output is what gets pasted.
+After a successful paste, final words fly to their own pasted bounds, falling
+back to the caret or text field and skipping the flight when no target exists.
+CPU or nonstreaming capture has the character's microphone reaction and final
+words only. Reduce Motion keeps a quiet still character with text and no flight.
+Turning the feature off hides it and stops target reads promptly; failed and
+cancelled output never produces a successful final flight. See the
+[Hex buddy contract and proof limits](labs.md#hex-buddy) (`dictate.hex-buddy`) for
+source references; native verification is pending.
+
 ### Dot scope
 
 The HUD is Dot scope on every OS ([rune_hud/dot_scope.rs](../../src/rune_hud/dot_scope.rs),

@@ -122,6 +122,8 @@ const FIRST_FRAME: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl HudSender {
     pub(crate) fn send(&self, event: HudEvent) {
+        #[cfg(target_os = "macos")]
+        crate::words_to_caret::observe(event);
         #[cfg(target_os = "windows")]
         if matches!(event, HudEvent::Started) {
             let presents = self.overlay.surface_stats().totals.presents;

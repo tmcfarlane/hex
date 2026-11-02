@@ -14,6 +14,15 @@ use super::{NAV_ROW_GAP, NAV_ROW_HEIGHT, Pane, Ui, VOICE_FILTER_ICON};
 use crate::desktop::i18n::{tr, tr_fill};
 use crate::labs::Feature;
 
+pub(super) fn fixture_link(ui: &mut Ui, feature: Feature) {
+    *ui = super::mac_fixture();
+    ui.labs_open = true;
+    ui.lab_flash = Some((
+        feature,
+        std::time::Instant::now() + std::time::Duration::from_secs(3600),
+    ));
+}
+
 pub(super) static LABS_ICON: Icon = Icon {
     name: "hex-labs",
     view: 16.0,

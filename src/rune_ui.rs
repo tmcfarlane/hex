@@ -1,13 +1,8 @@
 //! Hex's window on every OS, on Rune.
 //!
-//! The window talks to a host in the same process: on Linux the dictation
-//! host beside it (`linux_host`); on Windows and macOS the runtime thread
-//! `windows_rune` or `macos_rune` starts (`windows_host`, `macos_host`).
-//! Either way it saves `settings.json` through the host, which adopts it,
-//! and sends the same requests for listening, shortcuts, models, and
-//! updates. `platform::Capabilities` decides which panes and rows each OS
-//! shows. Everything is drawn with `rune-kit`'s components in OpenCode's
-//! design language (`rune-theme-opencode`); see `docs/design-system.md`.
+//! Platform hosts supply runtime snapshots, adopt saved settings, and carry
+//! out actions. `platform::Capabilities` selects each OS's panes and rows.
+//! Views use `rune-kit` and `rune-theme-opencode`; see `docs/design-system.md`.
 
 mod activity;
 #[cfg(hex_capture)]
@@ -20,6 +15,8 @@ mod found;
 mod found_choice;
 mod fun;
 mod general;
+#[cfg(target_os = "macos")]
+mod hex_buddy_painter;
 mod history;
 #[cfg_attr(target_os = "linux", path = "rune_ui/linux_host.rs")]
 #[cfg_attr(target_os = "windows", path = "rune_ui/windows_host.rs")]
@@ -2516,13 +2513,10 @@ const SCENES: &[Scene] = &[
         ui.labs_open = true;
     }),
     ("mac-labs-link", |ui| {
-        *ui = mac_fixture();
-        ui.labs_open = true;
-        // Far ahead, so the pulse holds for the render.
-        ui.lab_flash = Some((
-            crate::labs::Feature::VocabularyBiasing,
-            Instant::now() + Duration::from_secs(3600),
-        ));
+        labs::fixture_link(ui, crate::labs::Feature::VocabularyBiasing);
+    }),
+    ("mac-labs-buddy", |ui| {
+        labs::fixture_link(ui, crate::labs::Feature::WordsToCaret);
     }),
     ("mac-production", |ui| {
         *ui = mac_fixture();

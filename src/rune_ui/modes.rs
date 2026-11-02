@@ -1,8 +1,5 @@
-//! The Modes pane: the Global mode and custom modes chosen by the frontmost
-//! application, each with corrections, optional OpenCode rewriting, and
-//! transformations, built in or from the user's config. Text fields are drafts saved when
-//! typing pauses; every other edit saves at once and asks the service to
-//! reload.
+//! Global and application modes, with corrections, OpenCode rewriting, and transformations.
+//! Text drafts save when typing pauses; other edits save and reload the service at once.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -34,7 +31,6 @@ use crate::personal_commands::{HostState, StatusSnapshot, StatusTransformation};
 
 const LIST_WIDTH: f32 = 240.0;
 const FIELD_WIDTH: f32 = 280.0;
-/// How often the transformation host's status file is reread.
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
 static PLUS: &rune::Icon = &rune_theme_opencode::icons::PLUS;
@@ -72,7 +68,6 @@ pub(super) fn mode_mut(settings: &mut AppSettings, selection: Selection) -> &mut
     }
 }
 
-/// The selected mode's text fields.
 #[derive(Default)]
 struct Editor {
     name: TextEdit,
@@ -364,9 +359,6 @@ impl ModesPane {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Edits
-
 fn select_mode(ui: &mut Ui, selection: Selection) {
     if ui.modes.selected == selection {
         return;
@@ -620,9 +612,6 @@ fn provision_workspace(ui: &mut Ui) {
     });
     ui.modes.workspace_receiver = Some(receiver);
 }
-
-// ---------------------------------------------------------------------------
-// View
 
 pub(super) fn pane(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> (Vec<El>, El) {
     let add = IconButton::new(PLUS)
@@ -1410,9 +1399,6 @@ fn workspace_status(ui: &Ui, p: Paint) -> Option<El> {
     }
     Some(row)
 }
-
-// ---------------------------------------------------------------------------
-// Fixture
 
 /// Representative modes: a chat mode with corrections, rewriting, and
 /// transformations, and an empty one.

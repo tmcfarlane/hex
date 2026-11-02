@@ -367,6 +367,14 @@ fn main() -> Result<()> {
     if let Some(Command::App { rune_args, .. }) = &cli.command
         && !rune_args.is_empty()
     {
+        if rune_args
+            .windows(2)
+            .any(|args| args[0] == "--scene" && args[1] == "hex-buddy")
+            || rune_args.iter().any(|arg| arg == "--scene=hex-buddy")
+        {
+            rune_ui::words_to_caret::preview(rune_args.clone());
+            return Ok(());
+        }
         rune_ui::render_app(rune_args.clone()).run();
         return Ok(());
     }

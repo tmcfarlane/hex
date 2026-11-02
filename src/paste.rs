@@ -271,6 +271,9 @@ impl Paster {
         } else {
             self.paste_through_clipboard(&text, mode, commit)?;
         }
+        if matches!(mode, PasteMode::Continue) {
+            crate::words_to_caret::pasted(&text);
+        }
         self.continuation = (!matches!(mode, PasteMode::Standalone)).then_some(Continuation {
             revision,
             inserted: text,

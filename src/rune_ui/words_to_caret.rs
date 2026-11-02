@@ -1,27 +1,30 @@
-//! Labs › Words to cursor's overlay (macOS): a click-through Rune overlay
-//! that flies a pasted dictation's words from the HUD to where they landed
-//! in the focused app ([`crate::words_to_caret`] finds where). Each word
-//! arcs out with a stagger, eases past its slot and springs back, glows,
-//! and fades over the real text. Reduce Motion draws nothing.
-//!
-//! The overlay covers only the flight: the HUD, the landing rects, and room
-//! for the arcs, placed for each flight and hidden once every word is gone.
+//! The homepage character listens beside the HUD and sends visual words
+//! toward the caret. Partial words never insert text; final flights follow
+//! the normal paste. The Rune overlay passes every click through.
 
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use rune::{Cx, El, OverlayHandle, Tx, el};
+use rune::compose::{Compositor, DeviceKey, Frame};
+use rune::{Anim, Cx, El, OverlayHandle, Tx, el, text};
 
 use super::controls::Paint;
+use super::hex_buddy_painter::{Draw, Painter};
 use super::onboarding_kit::flight::{Pose, flying};
 use crate::accessibility::ScreenRect;
-use crate::words_to_caret::{Launch, Tuning};
+use crate::rune_hud::HudEvent;
+use crate::words_to_caret::{BuddyEvent, Launch, Tuning};
 
 /// The word's weight in the air.
 const WEIGHT: f32 = 560.0;
 /// Room around the flight for the glow and the overshoot.
 const MARGIN: f32 = 48.0;
 
-/// One word in the air, in the overlay's points.
+mod preview;
+pub(crate) use preview::preview;
+
+/// One word in the air, in global screen points.
 #[derive(Clone, Debug, PartialEq)]
 struct Word {
     text: String,
@@ -32,17 +35,39 @@ struct Word {
     start: f64,
     /// Which side the arc bows to.
     side: f32,
+    tuning: Tuning,
+    speculative: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct Flights {
     words: Vec<Word>,
-    tuning: Tuning,
-    pending: Option<Launch>,
+    pending: Vec<Launch>,
     size: [f32; 2],
+    origin: [f32; 2],
+    buddy: [f32; 4],
     now: f64,
+    generation: u64,
+    recording: bool,
+    jobs: BTreeSet<u64>,
+    target: Option<ScreenRect>,
+    seen: usize,
+    preview: String,
+    until: f64,
+    reduced: bool,
+    level: f32,
+    placement_pending: bool,
+    fixture: bool,
+    fixture_step: usize,
+    fixture_field: rune::TextEdit,
     overlay: Option<OverlayHandle<Flights>>,
     shown: bool,
+}
+
+static MOUTH: Mutex<Option<[f32; 2]>> = Mutex::new(None);
+
+pub(crate) fn mouth_origin() -> Option<[f32; 2]> {
+    *MOUTH.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 impl Word {
@@ -200,53 +225,287 @@ fn lay_out(launch: &Launch, now: f64) -> ([f32; 4], Vec<Word>) {
             land: font_size(rect.height),
             start: now + index as f64 * launch.tuning.stagger_ms / 1000.0,
             side: if index % 2 == 0 { -1.0 } else { 1.0 },
+            tuning: launch.tuning,
+            speculative: false,
         })
         .collect();
     (rect, words)
 }
 
-fn poll(s: &mut Flights, now: f64, tx: &mut Tx) -> bool {
-    s.now = now;
-    let Some(overlay) = s.overlay.clone() else {
-        return false;
-    };
-    if let Some(launch) = s.pending.take() {
-        let (rect, words) = lay_out(&launch, now);
-        s.words = words;
-        s.tuning = launch.tuning;
-        s.size = [rect[2], rect[3]];
-        overlay.set_placement(Some(rune::OverlayPlacement::Rect {
-            x: rect[0],
-            y: rect[1],
-            width: rect[2],
-            height: rect[3],
-        }));
-        overlay.resize((rect[2], rect[3]));
-        if !s.shown {
-            s.shown = true;
-            overlay.show();
-        }
-    }
-    if s.words.is_empty() {
-        return false;
-    }
-    if s.words.iter().all(|word| now >= word.gone(&s.tuning)) {
-        s.words.clear();
-        s.shown = false;
-        overlay.hide();
-        return true;
-    }
-    // Every word's pose is already exact for this instant.
-    tx.instant();
-    tx.wake_after(Duration::ZERO);
-    true
+fn tail(value: &str, limit: usize) -> String {
+    let chars = value.chars().count();
+    value.chars().skip(chars.saturating_sub(limit)).collect()
 }
 
-/// Adds the overlay, hidden, and sends it each flight. Prewarmed only when
-/// the lab is on at launch.
+impl Flights {
+    fn active(&self) -> bool {
+        self.recording || !self.jobs.is_empty() || self.now < self.until || !self.words.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.words.clear();
+        self.pending.clear();
+        self.recording = false;
+        self.jobs.clear();
+        self.target = None;
+        self.seen = 0;
+        self.preview.clear();
+        self.until = 0.0;
+        self.level = 0.0;
+        self.placement_pending = false;
+    }
+
+    fn draw(&self, output: [u32; 2], scale: f32) -> Draw {
+        Draw {
+            rect: [
+                (self.buddy[0] - self.origin[0]) * scale,
+                (self.buddy[1] - self.origin[1]) * scale,
+                self.buddy[2] * scale,
+                self.buddy[3] * scale,
+            ],
+            output,
+            time: self.now as f32,
+            level: if self.reduced { 0.0 } else { self.level },
+            reduced: self.reduced,
+        }
+    }
+
+    fn mouth(&self) -> [f32; 2] {
+        let mouth = self.draw([1, 1], 1.0).mouth();
+        [mouth[0] + self.origin[0], mouth[1] + self.origin[1]]
+    }
+
+    fn handle(&mut self, event: BuddyEvent, generation: u64, anchor: [f32; 2]) {
+        match event {
+            BuddyEvent::Hud(HudEvent::Started) => {
+                self.generation = generation;
+                self.recording = true;
+                self.target = None;
+                self.seen = 0;
+                self.preview.clear();
+                self.words.retain(|word| !word.speculative);
+                self.buddy = [anchor[0] - 55.0, anchor[1] + 35.0, 110.0, 110.0];
+                self.placement_pending = true;
+            }
+            BuddyEvent::Hud(HudEvent::Submitted { job_id }) if self.recording => {
+                self.recording = false;
+                self.jobs.insert(job_id);
+                self.until = self.now + 1.0;
+                self.preview.clear();
+            }
+            BuddyEvent::Hud(
+                HudEvent::JobCompleted { job_id }
+                | HudEvent::JobCancelled { job_id }
+                | HudEvent::JobFailed { job_id },
+            ) => {
+                if self.jobs.remove(&job_id) {
+                    self.until = self.now + 1.0;
+                }
+            }
+            BuddyEvent::Hud(HudEvent::Cancelled | HudEvent::Discarded | HudEvent::Failed) => {
+                self.recording = false;
+                self.target = None;
+                self.preview.clear();
+                self.words.retain(|word| !word.speculative);
+                self.until = 0.0;
+            }
+            BuddyEvent::Hud(HudEvent::Reset) => self.clear(),
+            BuddyEvent::Target { generation, target } if generation == self.generation => {
+                if self.target != target {
+                    self.words.retain(|word| !word.speculative);
+                }
+                self.target = target;
+            }
+            BuddyEvent::Partial {
+                generation,
+                stable,
+                tentative,
+            } if generation == self.generation && self.recording => {
+                self.preview = if self.reduced || tentative.trim().is_empty() {
+                    tail(format!("{stable} {tentative}").trim(), 60)
+                } else {
+                    tail(&tentative, 60)
+                };
+                // Stable snapshots may revise their prefix. A position is emitted
+                // once; a shorter or corrected snapshot never replays old words.
+                let words: Vec<_> = stable.split_whitespace().collect();
+                let appended = words.iter().skip(self.seen).copied().collect::<Vec<_>>();
+                self.seen = self.seen.max(words.len());
+                if !self.reduced
+                    && let Some(target) = self.target
+                {
+                    let from = self.mouth();
+                    let (x, y) = target.center();
+                    let tuning = Tuning {
+                        fade_ms: 65.0,
+                        glow: 0.0,
+                        land_push: 0.0,
+                        overshoot: 0.0,
+                        ..Tuning::default()
+                    };
+                    for (index, word) in appended
+                        .into_iter()
+                        .take(tuning.max_words)
+                        .filter(|word| word.chars().count() <= 64)
+                        .enumerate()
+                    {
+                        self.words.push(Word {
+                            text: word.to_string(),
+                            from,
+                            to: [x as f32, y as f32],
+                            land: font_size(target.height),
+                            start: self.now + index as f64 * tuning.stagger_ms / 1000.0,
+                            side: if index % 2 == 0 { -1.0 } else { 1.0 },
+                            tuning,
+                            speculative: true,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn advance(&mut self, now: f64, enabled: bool, reduced: bool) {
+        self.now = now;
+        self.reduced = reduced;
+        if !enabled {
+            self.clear();
+            return;
+        }
+        if reduced {
+            self.words.clear();
+        } else {
+            self.words.retain(|word| now < word.gone(&word.tuning));
+        }
+        for launch in std::mem::take(&mut self.pending) {
+            if self.buddy[2] == 0.0 {
+                self.buddy = [launch.from[0] - 55.0, launch.from[1] - 68.3, 110.0, 110.0];
+            }
+            if reduced {
+                if !self.recording {
+                    self.preview = tail(
+                        &launch
+                            .words
+                            .iter()
+                            .map(|(word, _)| word.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        60,
+                    );
+                }
+                self.until = now + 0.6;
+                continue;
+            }
+            let (rect, mut words) = lay_out(&launch, now);
+            for word in &mut words {
+                word.from = [word.from[0] + rect[0], word.from[1] + rect[1]];
+                word.to = [word.to[0] + rect[0], word.to[1] + rect[1]];
+            }
+            self.words.extend(words);
+            self.until = now + 0.6;
+        }
+        if self.words.len() > 64 {
+            self.words.drain(..self.words.len() - 64);
+        }
+    }
+
+    fn bounds(&self) -> [f32; 4] {
+        let [x, y, w, h] = self.buddy;
+        let mut min = [x - 100.0, y - 12.0];
+        let mut max = [x + w + 100.0, y + h + 48.0];
+        for word in &self.words {
+            let distance = (word.to[0] - word.from[0]).hypot(word.to[1] - word.from[1]);
+            let pad = MARGIN + distance * word.tuning.bend.abs() * 0.5;
+            for p in [word.from, word.to] {
+                min = [min[0].min(p[0] - pad), min[1].min(p[1] - pad)];
+                max = [max[0].max(p[0] + pad), max[1].max(p[1] + pad)];
+            }
+        }
+        [
+            min[0].floor(),
+            min[1].floor(),
+            (max[0] - min[0]).ceil(),
+            (max[1] - min[1]).ceil(),
+        ]
+    }
+}
+
+fn beside_hud(center: [f32; 2], below: bool) -> [f32; 4] {
+    [
+        center[0] - 55.0,
+        center[1] + if below { 35.0 } else { -145.0 },
+        110.0,
+        110.0,
+    ]
+}
+
+fn poll(s: &mut Flights, now: f64, tx: &mut Tx) -> bool {
+    let enabled = crate::labs::words_to_caret() && !crate::accessibility::secure_input();
+    s.advance(now, enabled, s.reduced);
+    s.level = if s.recording {
+        crate::audio::input_level::recent().unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let active = s.active();
+    if active && s.placement_pending {
+        // The HUD places itself on the same queue after Started. Let that
+        // turn finish before reading its display and top/bottom placement.
+        s.placement_pending = false;
+        tx.wake_after(Duration::from_millis(16));
+        return false;
+    }
+    if active {
+        let center =
+            crate::rune_hud::plate_center().unwrap_or_else(crate::words_to_caret::hud_spot);
+        let below = match crate::rune_hud::live_text_place() {
+            super::live_text::Spot::Global { below, .. } => below,
+            super::live_text::Spot::Edge(edge, _) => edge == rune::ScreenEdge::Top,
+        };
+        let buddy = beside_hud(center, below);
+        if buddy != s.buddy {
+            s.buddy = buddy;
+            s.words.retain(|word| !word.speculative);
+        }
+    }
+    *MOUTH.lock().unwrap_or_else(|error| error.into_inner()) = active.then(|| s.mouth());
+    if let Some(overlay) = &s.overlay {
+        if active {
+            let rect = s.bounds();
+            if s.origin != [rect[0], rect[1]] || s.size != [rect[2], rect[3]] {
+                s.origin = [rect[0], rect[1]];
+                s.size = [rect[2], rect[3]];
+                overlay.set_placement(Some(rune::OverlayPlacement::Rect {
+                    x: rect[0],
+                    y: rect[1],
+                    width: rect[2],
+                    height: rect[3],
+                }));
+                overlay.resize((rect[2], rect[3]));
+            }
+            if !s.shown {
+                overlay.show();
+            }
+        } else if s.shown {
+            overlay.hide();
+        }
+    }
+    let changed = active || s.shown;
+    s.shown = active;
+    tx.instant();
+    tx.wake_after(if active && !s.reduced {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(100)
+    });
+    changed
+}
+
+/// Adds the overlay without starting capture or reading another app.
 pub(crate) fn install<S: 'static>(app: &mut rune::App<S>) {
     use rune::{DisplayTarget, OverlayInput, OverlayLevel, OverlayOptions, OverlaySpec};
-    let spec = OverlaySpec::new("Hex words to cursor", (320.0, 240.0), view)
+    let spec = OverlaySpec::new("Hex buddy", (320.0, 240.0), view)
         .options(OverlayOptions {
             display: DisplayTarget::Primary,
             level: OverlayLevel::AboveStatus,
@@ -254,33 +513,148 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>) {
             prewarm: crate::labs::words_to_caret(),
             ..Default::default()
         })
-        .poll(poll);
+        .poll(poll)
+        .compositor(BuddyCompositor::default());
     let overlay = app.overlay(spec, Flights::default());
     let handle = overlay.clone();
     overlay.update(move |s, _| s.overlay = Some(handle));
+    let launches = overlay.clone();
     crate::words_to_caret::on_launch(move |launch| {
+        if !crate::labs::words_to_caret() {
+            return;
+        }
+        launches.update(move |s, tx| {
+            s.pending.push(launch);
+            tx.wake_after(Duration::ZERO);
+        });
+    });
+    crate::words_to_caret::on_event(move |event| {
+        if !crate::labs::words_to_caret()
+            || matches!(&event, BuddyEvent::Hud(HudEvent::Meter { .. }))
+        {
+            return;
+        }
+        let generation = crate::words_to_caret::generation();
+        let anchor =
+            crate::rune_hud::plate_center().unwrap_or_else(crate::words_to_caret::hud_spot);
         overlay.update(move |s, tx| {
-            s.pending = Some(launch);
+            s.handle(event, generation, anchor);
             tx.wake_after(Duration::ZERO);
         });
     });
 }
 
 fn view(s: &Flights, cx: &mut Cx<Flights>) -> El {
-    let root = el().size(s.size[0].max(1.0), s.size[1].max(1.0));
-    if s.words.is_empty() || cx.system_reduced_motion() {
+    let mut root = el()
+        .key("hex-buddy")
+        .size(s.size[0].max(1.0), s.size[1].max(1.0))
+        .hover_motion_within(Anim::INSTANT, Anim::INSTANT);
+    let p = Paint::new(cx.system_dark(), cx.env().scale);
+    if s.fixture {
+        root = root.child(preview::field(s, p));
+    }
+    if !s.active() {
         return root;
     }
-    let p = Paint::new(cx.system_dark(), cx.env().scale);
-    s.words
-        .iter()
-        .enumerate()
-        .fold(root, |root, (index, word)| {
-            match word.pose(s.now, &s.tuning) {
-                Some(pose) => root.child(flying(p, &format!("w{index}"), &word.text, WEIGHT, pose)),
-                None => root,
+    if !s.preview.trim().is_empty() {
+        root = root.child(
+            text(s.preview.clone())
+                .key("preview")
+                .absolute(
+                    s.buddy[0] - s.origin[0] - 95.0,
+                    s.buddy[1] - s.origin[1] + 112.0,
+                )
+                .w(300.0)
+                .truncate_head()
+                .font(p.k.ty.ui)
+                .color(p.text())
+                .px(10.0)
+                .py(5.0)
+                .radius(p.k.radius.md)
+                .fill(p.k.c.bg_base),
+        );
+    }
+    if !cx.system_reduced_motion() {
+        for (index, word) in s.words.iter().enumerate() {
+            if let Some(mut pose) = word.pose(s.now, &word.tuning) {
+                pose.x -= s.origin[0];
+                pose.y -= s.origin[1];
+                root = root.child(flying(p, &format!("w{index}"), &word.text, WEIGHT, pose));
             }
-        })
+        }
+    }
+    root
+}
+
+#[derive(Default)]
+struct BuddyCompositor {
+    gpu: Option<(DeviceKey, Painter)>,
+}
+
+impl Compositor<Flights> for BuddyCompositor {
+    fn render(&mut self, f: &mut Frame<'_, Flights>) {
+        f.rt.state.reduced = f.rt.reduced_motion;
+        f.ui.prepare(
+            f.device,
+            f.queue,
+            &mut f.rt.text.atlas,
+            &f.rt.instances,
+            f.size,
+        );
+        f.ui.encode_layers(f.encoder);
+        let clear = if f.rt.state.fixture {
+            let color = Paint::new(f.rt.env.system_dark, f.rt.env.scale).k.c.bg_base;
+            if f.srgb_blend() {
+                color.premul_srgb(1.0)
+            } else {
+                color.premul(1.0)
+            }
+        } else {
+            [0.0; 4]
+        };
+        drop(f.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Hex buddy clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: f.target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: clear[0] as f64,
+                        g: clear[1] as f64,
+                        b: clear[2] as f64,
+                        a: clear[3] as f64,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        }));
+        if f.rt.state.active() {
+            if self
+                .gpu
+                .as_ref()
+                .is_none_or(|(key, painter)| *key != f.device_key() || painter.format != f.format)
+            {
+                self.gpu = Some((f.device_key(), Painter::new(f.device, f.format)));
+            }
+            let painter = &self.gpu.as_ref().expect("created above").1;
+            let draw = f.rt.state.draw([f.size.0, f.size.1], f.rt.env.scale);
+            painter.write(draw, |buffer, data| f.write_buffer(buffer, 0, data));
+            painter.draw_over(f.encoder, f.target);
+        }
+        f.ui.draw_target_range_with(
+            f.encoder,
+            f.target,
+            f.format,
+            wgpu::LoadOp::Load,
+            0..f.rt.instances.len() as u32,
+            &mut |_, _| {},
+        );
+    }
 }
 
 #[cfg(test)]
@@ -350,5 +724,116 @@ mod tests {
         });
         assert!(past);
         assert_eq!(word.point(1.0, &tuning), word.to);
+    }
+
+    fn listening() -> Flights {
+        let mut s = Flights::default();
+        s.handle(BuddyEvent::Hud(HudEvent::Started), 1, [700.0, 20.0]);
+        s.handle(
+            BuddyEvent::Target {
+                generation: 1,
+                target: Some(launch().words[0].1),
+            },
+            1,
+            [700.0, 20.0],
+        );
+        s
+    }
+
+    fn partial(s: &mut Flights, stable: &str) {
+        s.handle(
+            BuddyEvent::Partial {
+                generation: 1,
+                stable: stable.into(),
+                tentative: String::new(),
+            },
+            1,
+            [700.0, 20.0],
+        );
+    }
+
+    #[test]
+    fn corrected_stable_prefixes_and_duplicate_updates_never_replay() {
+        let mut s = listening();
+        partial(&mut s, "one two");
+        assert_eq!(s.words.len(), 2);
+        partial(&mut s, "one two");
+        partial(&mut s, "won too");
+        partial(&mut s, "won");
+        assert_eq!(s.words.len(), 2);
+        partial(&mut s, "won too three");
+        assert_eq!(s.words.len(), 3);
+        assert_eq!(s.words[2].text, "three");
+        assert!(s.words.iter().all(|word| word.tuning.glow == 0.0));
+    }
+
+    #[test]
+    fn an_old_job_finishing_keeps_a_newer_capture_visible() {
+        let mut s = listening();
+        s.handle(
+            BuddyEvent::Hud(HudEvent::Submitted { job_id: 10 }),
+            1,
+            [700.0, 20.0],
+        );
+        s.handle(BuddyEvent::Hud(HudEvent::Started), 2, [700.0, 20.0]);
+        s.handle(
+            BuddyEvent::Hud(HudEvent::JobCompleted { job_id: 10 }),
+            2,
+            [700.0, 20.0],
+        );
+        s.advance(20.0, true, false);
+        assert!(s.recording && s.active());
+        assert_eq!(s.generation, 2);
+        assert!(s.jobs.is_empty());
+    }
+
+    #[test]
+    fn disabling_clears_capture_jobs_text_and_queued_flights() {
+        let mut s = listening();
+        partial(&mut s, "one two");
+        s.jobs.insert(10);
+        s.pending.push(launch());
+        s.advance(1.0, false, false);
+        assert!(!s.active());
+        assert!(s.words.is_empty() && s.pending.is_empty() && s.jobs.is_empty());
+        assert!(s.preview.is_empty() && s.target.is_none());
+    }
+
+    #[test]
+    fn reduced_motion_keeps_the_text_and_character_without_flights() {
+        let mut s = listening();
+        s.reduced = true;
+        partial(&mut s, "one two");
+        s.pending.push(launch());
+        s.advance(1.0, true, true);
+        assert!(s.active());
+        assert!(s.words.is_empty());
+        assert_eq!(s.preview, "one two");
+        assert!(s.draw([1000, 800], 1.0).reduced);
+    }
+
+    #[test]
+    fn a_target_change_removes_words_bound_for_the_old_field() {
+        let mut s = listening();
+        partial(&mut s, "one two");
+        s.handle(
+            BuddyEvent::Target {
+                generation: 1,
+                target: None,
+            },
+            1,
+            [700.0, 20.0],
+        );
+        assert!(s.words.is_empty());
+        partial(&mut s, "one two three");
+        assert!(s.words.is_empty());
+    }
+
+    #[test]
+    fn the_character_stays_toward_the_inside_of_either_hud_edge() {
+        let top = beside_hud([700.0, 20.0], true);
+        let bottom = beside_hud([700.0, 880.0], false);
+        assert!(top[1] > 20.0);
+        assert!(bottom[1] + bottom[3] < 880.0);
     }
 }

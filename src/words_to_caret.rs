@@ -1,22 +1,22 @@
-//! Labs › Words to cursor (macOS): a pasted dictation's words fly from the
-//! HUD to where the text landed in the focused app.
+//! Labs › Hex buddy (macOS): recording-owned live words and final pasted
+//! words leave the homepage character for the focused text cursor.
 //!
 //! The paste never waits for it. The output worker hands the pasted text to
 //! [`pasted`] after the paste returns, and one thread of its own reads the
 //! app through Accessibility (each call bounded by 50 ms): it waits up to
 //! `wait_ms` for the text before the cursor to read as the dictation, then
-//! sends every word to its own rect. When the app never shows the text, the
-//! words fly to the caret, or to the text field when only that is known,
-//! and with neither there is no flight. The overlay that draws it is
-//! `rune_ui::words_to_caret`.
+//! sends every word to its verified rect. An app that cannot confirm the
+//! pasted text gets no final flight. `rune_ui::words_to_caret` draws it.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 use crate::accessibility::{self, CaretTarget, ScreenRect};
+use crate::rune_hud::HudEvent;
 
 /// The flight's timings: `~/.config/hex/words-to-caret.json`, read as each
 /// flight launches, so an edit applies to the next dictation. Missing keys
@@ -73,12 +73,28 @@ impl Tuning {
             return Self::default();
         };
         match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            Ok(bytes) => serde_json::from_slice::<Self>(&bytes).map(Self::bounded).unwrap_or_else(|error| {
                 tracing::warn!(%error, path = %path.display(), "words to cursor tuning ignored");
                 Self::default()
             }),
             Err(_) => Self::default(),
         }
+    }
+
+    fn bounded(mut self) -> Self {
+        self.duration_ms = self.duration_ms.clamp(100.0, 1200.0);
+        self.stagger_ms = self.stagger_ms.clamp(0.0, 80.0);
+        self.bend = self.bend.clamp(-0.4, 0.4);
+        self.overshoot = self.overshoot.clamp(0.0, 1.5);
+        self.launch_size = self.launch_size.clamp(9.0, 48.0);
+        self.land_push = self.land_push.clamp(0.0, 20.0);
+        self.land_hz = self.land_hz.clamp(1.0, 20.0);
+        self.land_damping = self.land_damping.clamp(0.05, 0.95);
+        self.fade_ms = self.fade_ms.clamp(60.0, 800.0);
+        self.glow = self.glow.clamp(0.0, 1.0);
+        self.max_words = self.max_words.min(32);
+        self.wait_ms = self.wait_ms.clamp(50, 500);
+        self
     }
 }
 
@@ -96,37 +112,117 @@ pub(crate) struct Launch {
 enum Job {
     /// A dictation started in this app: Chromium needs a moment to wake its
     /// accessibility tree.
-    Wake(i32),
-    Pasted(String),
+    Target {
+        generation: u64,
+        pid: i32,
+    },
+    Pasted {
+        pid: i32,
+        text: String,
+    },
+}
+
+/// Observation only: neither these events nor the live words write text.
+pub(crate) enum BuddyEvent {
+    Hud(HudEvent),
+    Target {
+        generation: u64,
+        target: Option<ScreenRect>,
+    },
+    Partial {
+        generation: u64,
+        stable: String,
+        tentative: String,
+    },
 }
 
 static LAUNCH: OnceLock<Box<dyn Fn(Launch) + Send + Sync>> = OnceLock::new();
+static OBSERVER: OnceLock<Box<dyn Fn(BuddyEvent) + Send + Sync>> = OnceLock::new();
 static JOBS: OnceLock<SyncSender<Job>> = OnceLock::new();
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static RECORDING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
+
+pub(crate) fn on_event(observe: impl Fn(BuddyEvent) + Send + Sync + 'static) {
+    let _ = OBSERVER.set(Box::new(observe));
+    crate::dictation::live_text::watch(|partial| {
+        let Some(partial) =
+            partial.filter(|_| crate::labs::words_to_caret() && !accessibility::secure_input())
+        else {
+            return;
+        };
+        if !RECORDING.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(observe) = OBSERVER.get() {
+            observe(BuddyEvent::Partial {
+                generation: generation(),
+                stable: partial.stable.clone(),
+                tentative: partial.tentative.clone(),
+            });
+        }
+        request_target();
+    });
+}
+
+/// Called on the HUD's reporting path. All Accessibility work is queued.
+pub(crate) fn observe(event: HudEvent) {
+    if !crate::labs::words_to_caret() {
+        RECORDING.store(false, Ordering::Release);
+        return;
+    }
+    match event {
+        HudEvent::Started => {
+            GENERATION.fetch_add(1, Ordering::AcqRel);
+            RECORDING.store(true, Ordering::Release);
+        }
+        HudEvent::Submitted { .. }
+        | HudEvent::Cancelled
+        | HudEvent::Discarded
+        | HudEvent::Reset
+        | HudEvent::Failed => RECORDING.store(false, Ordering::Release),
+        _ => {}
+    }
+    if let Some(observe) = OBSERVER.get() {
+        observe(BuddyEvent::Hud(event));
+    }
+    if matches!(event, HudEvent::Started) {
+        request_target();
+    }
+}
+
+fn request_target() {
+    if let Some(pid) = crate::dictation::context::frontmost_pid() {
+        send(Job::Target {
+            generation: generation(),
+            pid,
+        });
+    }
+}
 
 /// Where flights go: the overlay, set once as it installs.
 pub(crate) fn on_launch(launch: impl Fn(Launch) + Send + Sync + 'static) {
     let _ = LAUNCH.set(Box::new(launch));
 }
 
-/// A dictation is about to start in the frontmost app.
-pub(crate) fn wake() {
-    if crate::labs::words_to_caret()
-        && let Some(pid) = crate::dictation::context::frontmost_pid()
-    {
-        send(Job::Wake(pid));
-    }
-}
-
 /// `text` was just pasted. Never waits; a busy thread drops the flight.
 pub(crate) fn pasted(text: &str) {
     if crate::labs::words_to_caret() && LAUNCH.get().is_some() && !text.trim().is_empty() {
-        send(Job::Pasted(text.to_string()));
+        if let Some(pid) = crate::dictation::context::frontmost_pid() {
+            send(Job::Pasted {
+                pid,
+                text: text.to_string(),
+            });
+        }
     }
 }
 
 fn send(job: Job) {
     let jobs = JOBS.get_or_init(|| {
-        let (sender, receiver) = mpsc::sync_channel(2);
+        let (sender, receiver) = mpsc::sync_channel(4);
         if let Err(error) = std::thread::Builder::new()
             .name("words-to-caret".into())
             .spawn(move || run(receiver))
@@ -140,17 +236,56 @@ fn send(job: Job) {
 
 fn run(jobs: Receiver<Job>) {
     while let Ok(job) = jobs.recv() {
+        if !crate::labs::words_to_caret() {
+            continue;
+        }
         match job {
-            Job::Wake(pid) => accessibility::wake_text_markers(pid),
-            Job::Pasted(text) => {
+            Job::Target {
+                generation: id,
+                pid,
+            } => {
+                if id != generation()
+                    || !RECORDING.load(Ordering::Acquire)
+                    || accessibility::secure_input()
+                {
+                    continue;
+                }
+                let deadline = Instant::now() + Duration::from_millis(300);
+                let allowed = || {
+                    admitted(pid, deadline)
+                        && id == generation()
+                        && RECORDING.load(Ordering::Acquire)
+                };
+                accessibility::wake_text_markers(pid, &allowed);
+                let focus = accessibility::caret_focus(pid, &allowed);
+                let target = focus
+                    .as_ref()
+                    .and_then(|focus| match focus.target(&allowed) {
+                        Some(CaretTarget::Caret(rect)) => Some(rect),
+                        _ => None,
+                    });
+                if allowed()
+                    && let Some(observe) = OBSERVER.get()
+                {
+                    observe(BuddyEvent::Target {
+                        generation: id,
+                        target,
+                    });
+                }
+            }
+            Job::Pasted { pid, text } => {
                 let started = Instant::now();
-                let launch = find(&text);
+                let launch = find(pid, &text);
                 tracing::debug!(
                     words = launch.as_ref().map_or(0, |launch| launch.words.len()),
                     find_ms = started.elapsed().as_millis(),
                     "words to cursor"
                 );
-                if let (Some(launch), Some(send)) = (launch, LAUNCH.get()) {
+                if crate::labs::words_to_caret()
+                    && !accessibility::secure_input()
+                    && crate::dictation::context::frontmost_pid() == Some(pid)
+                    && let (Some(launch), Some(send)) = (launch, LAUNCH.get())
+                {
                     send(launch);
                 }
             }
@@ -158,30 +293,43 @@ fn run(jobs: Receiver<Job>) {
     }
 }
 
-/// Where `text`'s words go, read from the frontmost app.
-fn find(text: &str) -> Option<Launch> {
-    if accessibility::secure_input() {
+/// Every AX read and every delivery checks the same deadline and admission.
+fn admitted(pid: i32, deadline: Instant) -> bool {
+    Instant::now() < deadline
+        && crate::labs::words_to_caret()
+        && !accessibility::secure_input()
+        && crate::dictation::context::frontmost_pid() == Some(pid)
+}
+
+/// Retain one focused element and verify the inserted words. A cursor-only
+/// fallback cannot establish which field received this paste, so it is skipped.
+fn find(pid: i32, text: &str) -> Option<Launch> {
+    let tuning = Tuning::load();
+    if tuning.max_words == 0 || text.trim().is_empty() {
         return None;
     }
-    let tuning = Tuning::load();
-    let pid = crate::dictation::context::frontmost_pid()?;
-    let from = crate::rune_hud::plate_center().unwrap_or_else(hud_spot);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(tuning.wait_ms);
+    let allowed = || admitted(pid, deadline);
+    let focus = accessibility::caret_focus(pid, &allowed)?;
+    let from = crate::rune_ui::words_to_caret::mouth_origin().unwrap_or_else(hud_spot);
     let words: Vec<&str> = text.split_whitespace().take(tuning.max_words).collect();
-    let deadline = Instant::now() + Duration::from_millis(tuning.wait_ms);
-    let rects = loop {
-        if let Some(rects) = accessibility::pasted_words(pid, text, tuning.max_words) {
-            break Some(rects);
+    let words = loop {
+        if !allowed() {
+            return None;
         }
-        if Instant::now() >= deadline {
-            break None;
+        if let Some(rects) = focus.words(text, tuning.max_words, &allowed) {
+            break land_on_words(&words, &rects);
+        }
+        if !allowed() {
+            return None;
         }
         std::thread::sleep(Duration::from_millis(8));
     };
-    let words = match rects {
-        Some(rects) => land_on_words(&words, &rects),
-        None => land_on_target(&words, accessibility::caret_target(pid)?),
-    };
-    (!words.is_empty()).then_some(Launch {
+    if words.is_empty() || !focus.is_current(pid, &allowed) || !allowed() {
+        return None;
+    }
+    Some(Launch {
         from,
         words,
         tuning,
@@ -190,7 +338,7 @@ fn find(text: &str) -> Option<Launch> {
 
 /// Where the HUD's plate sits before its first show: under the primary
 /// display's menu bar, in the middle.
-fn hud_spot() -> [f32; 2] {
+pub(crate) fn hud_spot() -> [f32; 2] {
     #[repr(C)]
     struct CgRect {
         x: f64,
@@ -220,24 +368,6 @@ fn land_on_words(words: &[&str], rects: &[Option<ScreenRect>]) -> Vec<(String, S
         .collect()
 }
 
-/// Every word into the caret, or near the text field's leading edge when
-/// only the field is known.
-fn land_on_target(words: &[&str], target: CaretTarget) -> Vec<(String, ScreenRect)> {
-    let rect = match target {
-        CaretTarget::Caret(rect) => rect,
-        CaretTarget::Field(field) => {
-            let height = field.height.min(20.0);
-            ScreenRect {
-                x: field.x + 16.0,
-                y: field.y + field.height / 2.0 - height / 2.0,
-                width: 0.0,
-                height,
-            }
-        }
-    };
-    words.iter().map(|word| (word.to_string(), rect)).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,29 +392,22 @@ mod tests {
     }
 
     #[test]
-    fn a_field_alone_lands_words_near_its_leading_edge() {
-        let field = ScreenRect {
-            x: 100.0,
-            y: 200.0,
-            width: 400.0,
-            height: 30.0,
-        };
-        let landed = land_on_target(&["hi"], CaretTarget::Field(field));
-        assert_eq!(
-            landed[0].1,
-            ScreenRect {
-                x: 116.0,
-                y: 205.0,
-                width: 0.0,
-                height: 20.0,
-            }
-        );
-    }
-
-    #[test]
     fn missing_tuning_keys_keep_their_defaults() {
         let tuning: Tuning = serde_json::from_str(r#"{"duration_ms": 500}"#).unwrap();
         assert_eq!(tuning.duration_ms, 500.0);
         assert_eq!(tuning.stagger_ms, Tuning::default().stagger_ms);
+    }
+
+    #[test]
+    fn tuning_cannot_keep_the_worker_or_overlay_busy_without_bound() {
+        let tuning: Tuning = serde_json::from_str(
+            r#"{"wait_ms": 999999, "max_words": 999999, "duration_ms": 1e100, "stagger_ms": 1e100, "fade_ms": 1e100}"#,
+        ).unwrap();
+        let tuning = tuning.bounded();
+        assert!(tuning.wait_ms <= 500);
+        assert!(tuning.max_words <= 32);
+        let last_word_gone_ms =
+            tuning.duration_ms + tuning.stagger_ms * tuning.max_words as f64 + tuning.fade_ms;
+        assert!(last_word_gone_ms < 5000.0);
     }
 }

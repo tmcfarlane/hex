@@ -438,9 +438,17 @@ Sources: [native hand-off and target lookup](../../src/words_to_caret.rs),
 Checks include `words_to_caret_is_its_own_bit_and_off_by_default`,
 `words_to_caret_reaches_every_build_on_macos`, and
 `all_switches_fit_below_the_idle_minutes` in [labs.rs](../../src/labs.rs).
-Pure behavior checks and Linux golden regeneration are planned for this change;
-native microphone, caret targeting, focus, multi-display placement, and Reduce
-Motion verification remain pending. The overlay has no standard golden scene.
+Observed November 2, 2026: the required Linux golden update run passed
+395 tests (3 ignored), followed by the same passing comparison with only the
+four reviewed Buddy/Labs-link images updated. This used Rust 1.99.1 on ARM64
+Linux with Mesa 25 lavapipe in an isolated container. The `mac-labs-buddy`
+scene covers the row in both themes; the overlay has its own deterministic
+macOS `hex-buddy` rehearsal, reviewed in light and dark and as a 60 fps clip.
+The focused macOS behavior, paste, and shader checks passed (34 tests).
+The broader macOS Rune UI run had 348 passing checks and one unchanged
+meeting-capsule `call-ended-light` golden mismatch. Native microphone, caret
+targeting, click-through/focus, multiple displays, and OS Reduce Motion still
+need end-to-end observation. The rehearsal does not exercise those paths.
 
 Use your own speech model (`custom-models`) graduated: adding a model file
 and models found on this computer are always on now

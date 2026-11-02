@@ -41,6 +41,9 @@ pub(crate) fn preview(args: Vec<String>) {
 }
 
 fn poll(s: &mut Flights, time: f64, tx: &mut Tx) -> bool {
+    let was_active = s.active();
+    let had_words = !s.words.is_empty();
+    let previous_step = s.fixture_step;
     let now = time + 1.6;
     s.now = now;
     if s.fixture_step == 0 {
@@ -49,10 +52,10 @@ fn poll(s: &mut Flights, time: f64, tx: &mut Tx) -> bool {
             BuddyEvent::Target {
                 generation: 1,
                 target: Some(ScreenRect {
-                    x: 305.0,
-                    y: 240.0,
+                    x: 296.0,
+                    y: 237.0,
                     width: 1.0,
-                    height: 20.0,
+                    height: 16.0,
                 }),
             },
             1,
@@ -83,17 +86,17 @@ fn poll(s: &mut Flights, time: f64, tx: &mut Tx) -> bool {
         );
         s.fixture_field = TextEdit::new(LINE);
         s.fixture_field.focused = true;
-        let font = rune_theme_opencode::kit(true).ty.ui;
-        let mut x = 304.0;
+        let font = rune_theme_opencode::kit(true).ty.ui_compact;
+        let mut x = 296.0;
         let landings = words
             .iter()
             .map(|word| {
                 let width = rune::text::measure(word, &[], font, None).0;
                 let rect = ScreenRect {
                     x,
-                    y: 240.0,
+                    y: 237.0,
                     width: width as f64,
-                    height: 20.0,
+                    height: 16.0,
                 };
                 x += width as f64 + rune::text::measure(" ", &[], font, None).0 as f64;
                 (word.to_string(), rect)
@@ -121,8 +124,11 @@ fn poll(s: &mut Flights, time: f64, tx: &mut Tx) -> bool {
         0.0
     };
     tx.instant();
-    tx.wake_after(Duration::from_millis(16));
-    true
+    let active = s.active();
+    if active {
+        tx.wake_after(Duration::from_millis(16));
+    }
+    had_words || !s.words.is_empty() || active != was_active || previous_step != s.fixture_step
 }
 
 pub(super) fn field(s: &Flights, p: Paint) -> El {

@@ -115,7 +115,7 @@ impl ScreenRect {
     }
 }
 
-/// Where a paste into the frontmost app went, for Labs › Words to cursor.
+/// Where a paste into the frontmost app went, for Labs › Hex buddy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CaretTarget {
     /// The insertion point itself.

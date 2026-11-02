@@ -221,6 +221,14 @@ fn rows(ui: &Ui) -> Vec<Row> {
         tr("Live text"),
         tr("Show provisional words beside the HUD while dictating"),
     ));
+    if caps.os == super::platform::Os::Macos {
+        rows.push(row(
+            Feature::WordsToCaret,
+            &HINTS,
+            tr("Hex buddy"),
+            tr("The homepage character speaks your words toward the text cursor"),
+        ));
+    }
     if caps.meetings {
         rows.push(row(
             Feature::LiveChapters,
@@ -312,13 +320,6 @@ fn rows(ui: &Ui) -> Vec<Row> {
                 &KEYBOARD,
                 tr("Tap or hold"),
                 tr("In Toggle mode, hold the shortcut to dictate until you let go; a short tap still starts and stops"),
-            ));
-            // Reads the cursor's position through macOS Accessibility.
-            rows.push(row(
-                Feature::WordsToCaret,
-                &HINTS,
-                tr("Hex buddy"),
-                tr("The homepage character speaks your words toward the text cursor"),
             ));
             // macOS's menu-bar menu lists them.
             rows.push(row(

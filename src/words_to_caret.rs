@@ -1,8 +1,8 @@
 //! Labs › Hex buddy (macOS): recording-owned live words and final pasted
 //! words leave the homepage character for the focused text cursor.
 //!
-//! The paste never waits for it. The output worker hands the pasted text to
-//! [`pasted`] after the paste returns, and one thread of its own reads the
+//! The paste never waits for it. Successful insertion hands its actual text
+//! to [`pasted`], and one thread of its own reads the
 //! app through Accessibility (each call bounded by 50 ms): it waits up to
 //! `wait_ms` for the text before the cursor to read as the dictation, then
 //! sends every word to its verified rect. An app that cannot confirm the
@@ -32,7 +32,7 @@ pub(crate) struct Tuning {
     pub(crate) bend: f32,
     /// The ease-out-back overshoot at the landing (0 for none).
     pub(crate) overshoot: f32,
-    /// A word's size as it leaves the HUD, in points.
+    /// A word's size as it leaves the mouth, in points.
     pub(crate) launch_size: f32,
     /// The landing's spring: its push in points, frequency, and damping.
     pub(crate) land_push: f32,
@@ -102,7 +102,7 @@ impl Tuning {
 /// top-left, y down).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Launch {
-    /// The HUD plate's middle.
+    /// The character's mouth.
     pub(crate) from: [f32; 2],
     /// Each word and the rect it lands on, in order.
     pub(crate) words: Vec<(String, ScreenRect)>,
@@ -312,7 +312,7 @@ fn find(pid: i32, text: &str) -> Option<Launch> {
     let deadline = started + Duration::from_millis(tuning.wait_ms);
     let allowed = || admitted(pid, deadline);
     let focus = accessibility::caret_focus(pid, &allowed)?;
-    let from = crate::rune_ui::words_to_caret::mouth_origin().unwrap_or_else(hud_spot);
+    let from = crate::rune_ui::words_to_caret::mouth_origin();
     let words: Vec<&str> = text.split_whitespace().take(tuning.max_words).collect();
     let words = loop {
         if !allowed() {
@@ -364,7 +364,10 @@ fn land_on_words(words: &[&str], rects: &[Option<ScreenRect>]) -> Vec<(String, S
     words
         .iter()
         .zip(rects)
-        .filter_map(|(word, rect)| rect.map(|rect| (word.to_string(), rect)))
+        .filter_map(|(word, rect)| {
+            rect.filter(|_| word.chars().count() <= 64)
+                .map(|rect| (word.to_string(), rect))
+        })
         .collect()
 }
 
@@ -382,9 +385,13 @@ mod tests {
     }
 
     #[test]
-    fn a_word_without_a_believable_rect_does_not_fly() {
-        let words = ["so", "the", "plan"];
-        let landed = land_on_words(&words, &[Some(rect(10.0)), None, Some(rect(60.0))]);
+    fn only_bounded_words_with_believable_rects_fly() {
+        let oversized = "x".repeat(65);
+        let words = ["so", &oversized, "the", "plan"];
+        let landed = land_on_words(
+            &words,
+            &[Some(rect(10.0)), Some(rect(30.0)), None, Some(rect(60.0))],
+        );
         assert_eq!(
             landed,
             vec![("so".into(), rect(10.0)), ("plan".into(), rect(60.0))]

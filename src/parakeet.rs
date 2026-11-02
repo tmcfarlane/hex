@@ -517,13 +517,7 @@ fn run_output_worker(
     events: &mpsc::Sender<WorkerEvent>,
 ) {
     let mut paster = Paster::new(activity);
-    // Debug builds: a last dictation to paste again and again (Option-Shift-V,
-    // `hex paste-last`) without a microphone, as for tuning Labs › Words to
-    // cursor.
-    let mut last_transcript = cfg!(debug_assertions)
-        .then(|| std::env::var("HEX_DEV_LAST_DICTATION").ok())
-        .flatten()
-        .filter(|text| !text.trim().is_empty());
+    let mut last_transcript = None;
     let mut ordered = OrderedOutputs::default();
     while let Ok(job) = jobs.recv() {
         if matches!(job, OutputJob::PreparePaste) {

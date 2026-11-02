@@ -3,7 +3,8 @@
 //! the normal paste. The Rune overlay passes every click through.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rune::compose::{Compositor, DeviceKey, Frame};
@@ -62,12 +63,24 @@ pub(crate) struct Flights {
     fixture_field: rune::TextEdit,
     overlay: Option<OverlayHandle<Flights>>,
     shown: bool,
+    animating: Arc<AtomicBool>,
 }
 
 static MOUTH: Mutex<Option<[f32; 2]>> = Mutex::new(None);
 
-pub(crate) fn mouth_origin() -> Option<[f32; 2]> {
-    *MOUTH.lock().unwrap_or_else(|error| error.into_inner())
+pub(crate) fn mouth_origin() -> [f32; 2] {
+    if let Some(mouth) = *MOUTH.lock().unwrap_or_else(|error| error.into_inner()) {
+        return mouth;
+    }
+    let center = crate::rune_hud::plate_center().unwrap_or_else(crate::words_to_caret::hud_spot);
+    Draw {
+        rect: beside_hud(center, below_hud()),
+        output: [1, 1],
+        time: 0.0,
+        level: 0.0,
+        reduced: true,
+    }
+    .mouth()
 }
 
 impl Word {
@@ -243,6 +256,7 @@ impl Flights {
     }
 
     fn clear(&mut self) {
+        self.animating.store(false, Ordering::Release);
         self.words.clear();
         self.pending.clear();
         self.recording = false;
@@ -408,6 +422,8 @@ impl Flights {
         if self.words.len() > 64 {
             self.words.drain(..self.words.len() - 64);
         }
+        self.animating
+            .store(self.active() && !reduced, Ordering::Release);
     }
 
     fn bounds(&self) -> [f32; 4] {
@@ -440,7 +456,17 @@ fn beside_hud(center: [f32; 2], below: bool) -> [f32; 4] {
     ]
 }
 
+fn below_hud() -> bool {
+    match crate::rune_hud::live_text_place() {
+        super::live_text::Spot::Global { below, .. } => below,
+        super::live_text::Spot::Edge(edge, _) => edge == rune::ScreenEdge::Top,
+    }
+}
+
 fn poll(s: &mut Flights, now: f64, tx: &mut Tx) -> bool {
+    let had_words = !s.words.is_empty();
+    let previous_origin = s.origin;
+    let previous_size = s.size;
     let enabled = crate::labs::words_to_caret() && !crate::accessibility::secure_input();
     s.advance(now, enabled, s.reduced);
     s.level = if s.recording {
@@ -459,11 +485,7 @@ fn poll(s: &mut Flights, now: f64, tx: &mut Tx) -> bool {
     if active {
         let center =
             crate::rune_hud::plate_center().unwrap_or_else(crate::words_to_caret::hud_spot);
-        let below = match crate::rune_hud::live_text_place() {
-            super::live_text::Spot::Global { below, .. } => below,
-            super::live_text::Spot::Edge(edge, _) => edge == rune::ScreenEdge::Top,
-        };
-        let buddy = beside_hud(center, below);
+        let buddy = beside_hud(center, below_hud());
         if buddy != s.buddy {
             s.buddy = buddy;
             s.words.retain(|word| !word.speculative);
@@ -491,14 +513,20 @@ fn poll(s: &mut Flights, now: f64, tx: &mut Tx) -> bool {
             overlay.hide();
         }
     }
-    let changed = active || s.shown;
+    let changed = had_words
+        || !s.words.is_empty()
+        || active != s.shown
+        || previous_origin != s.origin
+        || previous_size != s.size;
     s.shown = active;
     tx.instant();
-    tx.wake_after(if active && !s.reduced {
-        Duration::ZERO
-    } else {
-        Duration::from_millis(100)
-    });
+    if active {
+        tx.wake_after(if s.reduced {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(16)
+        });
+    }
     changed
 }
 
@@ -593,10 +621,19 @@ fn view(s: &Flights, cx: &mut Cx<Flights>) -> El {
 #[derive(Default)]
 struct BuddyCompositor {
     gpu: Option<(DeviceKey, Painter)>,
+    animating: Option<Arc<AtomicBool>>,
 }
 
 impl Compositor<Flights> for BuddyCompositor {
+    fn animating(&self) -> bool {
+        self.animating
+            .as_ref()
+            .is_some_and(|active| active.load(Ordering::Acquire))
+    }
+
     fn render(&mut self, f: &mut Frame<'_, Flights>) {
+        self.animating
+            .get_or_insert_with(|| f.rt.state.animating.clone());
         f.rt.state.reduced = f.rt.reduced_motion;
         f.ui.prepare(
             f.device,
@@ -646,7 +683,10 @@ impl Compositor<Flights> for BuddyCompositor {
                 self.gpu = Some((f.device_key(), Painter::new(f.device, f.format)));
             }
             let painter = &self.gpu.as_ref().expect("created above").1;
-            let draw = f.rt.state.draw([f.size.0, f.size.1], f.rt.env.scale);
+            let mut draw = f.rt.state.draw([f.size.0, f.size.1], f.rt.env.scale);
+            if !f.rt.state.fixture {
+                draw.time = f.rt.t as f32;
+            }
             painter.write(draw, |buffer, data| f.write_buffer(buffer, 0, data));
             painter.draw_over(f.encoder, f.target);
         }

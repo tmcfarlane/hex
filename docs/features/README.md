@@ -28,13 +28,17 @@ Hex                                      // macOS release
 have detailed maps.
 Agents can [read retained transcripts](transcript-cli.md) and
 [control the running app](control-cli.md) with the release CLI.
-[Labs](labs.md) is one switch, on by default, for every unfinished feature.
+[Labs](labs.md) lists unfinished features as separate toggles, each off by default.
 Its Restore shortcut default toggle (off by default) puts a Restore default
 button beside Paste last dictation's shortcut (#613); its Sort and filter
 models toggle (off by default) adds a sort and a saved-language filter to the
 Local transcription picker (#645); its Benchmark details toggle (off by
 default) shows each model's raw WER or CER with its language, dataset, source,
 and conditions (#647).
+On macOS, [Hex buddy](labs.md#hex-buddy) adds the homepage character beside the
+dictation HUD and inserts stable words live during eligible physical-hotkey
+dictation, with confirmed words flying to their text slots. It is off by
+default; native editing and end-to-end verification are still pending.
 General › Advanced › Interface language offers Português (Brasil), and Hex
 uses it for any Portuguese system language (#867); it also offers Français,
 used for any French system language (#892). Neither has had a native

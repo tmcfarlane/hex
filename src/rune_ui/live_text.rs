@@ -120,7 +120,7 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>, place: Place) {
     let _ = LIVE.set(overlay.clone());
     let shown = Arc::new(AtomicBool::new(false));
     crate::dictation::live_text::watch(move |partial| {
-        let partial = partial.filter(|partial| !is_blank(partial));
+        let partial = partial.filter(|partial| crate::labs::live_text() && !is_blank(partial));
         let Some(Partial { stable, tentative }) = partial.cloned() else {
             if shown.swap(false, Ordering::AcqRel) {
                 // Hidden from the same queue that shows it, so a recording

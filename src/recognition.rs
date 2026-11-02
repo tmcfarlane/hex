@@ -379,7 +379,7 @@ pub fn listen(
         hotkeys.suspend_all();
     }
     if hotkeys.dictation.is_recording() {
-        let accepted = input.start(capture_boundary(
+        let accepted = input.start_live(capture_boundary(
             &input,
             microphone_policy.release_while_idle,
         ))?;
@@ -800,6 +800,7 @@ pub fn listen(
             handle_hotkey_action(
                 HotkeyAction::Cancel,
                 false,
+                false,
                 input.captured_through(),
                 &input,
                 &dictation_worker,
@@ -824,6 +825,7 @@ pub fn listen(
         if hotkey_capture_suspended && hotkeys.suspend_all() {
             handle_hotkey_action(
                 HotkeyAction::Cancel,
+                false,
                 false,
                 input.captured_through(),
                 &input,
@@ -901,6 +903,7 @@ pub fn listen(
                 let accepted = handle_hotkey_action(
                     action,
                     hotkeys.raw_capture,
+                    true,
                     capture_at,
                     &input,
                     &dictation_worker,
@@ -1232,6 +1235,7 @@ fn cancel_programmatic_capture(
 fn handle_hotkey_action(
     action: HotkeyAction,
     raw: bool,
+    live_output: bool,
     action_at: CaptureInstant,
     dictation: &DictationAudio,
     worker: &DictationWorker,
@@ -1243,7 +1247,12 @@ fn handle_hotkey_action(
 ) -> Result<bool> {
     match action {
         HotkeyAction::Start => {
-            if !dictation.start(action_at)? {
+            let started = if live_output {
+                dictation.start_live(action_at)?
+            } else {
+                dictation.start(action_at)?
+            };
+            if !started {
                 return Ok(false);
             }
             // The tone confirms the press at once; a chord or short tap
@@ -1452,6 +1461,7 @@ fn control_dictation(
             let accepted = handle_hotkey_action(
                 HotkeyAction::Start,
                 raw,
+                false,
                 capture_boundary(input, release_while_idle),
                 input,
                 worker,

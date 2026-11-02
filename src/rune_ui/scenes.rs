@@ -597,13 +597,10 @@ pub(super) const SCENES: &[Scene] = &[
         ui.labs_open = true;
     }),
     ("mac-labs-link", |ui| {
-        *ui = mac_fixture();
-        ui.labs_open = true;
-        // Far ahead, so the pulse holds for the render.
-        ui.lab_flash = Some((
-            crate::labs::Feature::VocabularyBiasing,
-            Instant::now() + Duration::from_secs(3600),
-        ));
+        labs::fixture_link(ui, crate::labs::Feature::VocabularyBiasing);
+    }),
+    ("mac-labs-buddy", |ui| {
+        labs::fixture_link(ui, crate::labs::Feature::WordsToCaret);
     }),
     ("mac-production", |ui| {
         *ui = mac_fixture();

@@ -2324,6 +2324,7 @@ fn goldens() {
         for scene in [
             "history",
             "mac-labs-link",
+            "mac-labs-buddy",
             "output",
             "modes",
             "modes-picker",

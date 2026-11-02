@@ -20,6 +20,8 @@ mod found;
 mod found_choice;
 mod fun;
 mod general;
+#[cfg(target_os = "macos")]
+mod hex_buddy_painter;
 mod history;
 #[cfg_attr(target_os = "linux", path = "rune_ui/linux_host.rs")]
 #[cfg_attr(target_os = "windows", path = "rune_ui/windows_host.rs")]
@@ -62,6 +64,8 @@ mod spark;
 #[cfg(target_os = "macos")]
 pub(crate) mod story_link;
 mod vocabulary;
+#[cfg(target_os = "macos")]
+pub(crate) mod words_to_caret;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

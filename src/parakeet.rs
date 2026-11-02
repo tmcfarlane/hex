@@ -24,6 +24,8 @@ use crate::transcription::models::{
     TranscriptionModelId, TranscriptionSelection, model_path, validate,
 };
 
+mod live_output;
+
 pub struct Parakeet {
     session: OfflineGgufSession,
     options: RunOptions,
@@ -99,6 +101,7 @@ pub enum TranscriptionTarget {
 
 struct InferenceJob {
     job_id: DictationJobId,
+    capture_id: Option<u64>,
     control: Arc<JobControl>,
     submitted_at: Instant,
     transcript: PendingTranscript,
@@ -110,6 +113,7 @@ struct InferenceJob {
 
 struct ProcessorJob {
     job_id: DictationJobId,
+    capture_id: Option<u64>,
     control: Arc<JobControl>,
     target: TranscriptionTarget,
     text: String,
@@ -138,14 +142,17 @@ struct CompletedTranscript {
 
 enum OutputJob {
     PreparePaste,
+    WakeLive,
     Completed {
         job_id: DictationJobId,
+        capture_id: Option<u64>,
         control: Arc<JobControl>,
         target: TranscriptionTarget,
         result: Box<Result<CompletedTranscript, String>>,
     },
     Cancelled {
         job_id: DictationJobId,
+        capture_id: Option<u64>,
     },
     Paste {
         sequence: u64,
@@ -156,8 +163,8 @@ enum OutputJob {
 impl OutputJob {
     fn sequence(&self) -> u64 {
         match self {
-            Self::PreparePaste => u64::MAX,
-            Self::Completed { job_id, .. } | Self::Cancelled { job_id } => job_id.0,
+            Self::PreparePaste | Self::WakeLive => u64::MAX,
+            Self::Completed { job_id, .. } | Self::Cancelled { job_id, .. } => job_id.0,
             Self::Paste { sequence, .. } => *sequence,
         }
     }
@@ -226,6 +233,7 @@ pub struct DictationWorker {
     engine: Option<Arc<TranscriptionEngine>>,
     inference_jobs: Option<SyncSender<InferenceJob>>,
     output_jobs: Option<SyncSender<OutputJob>>,
+    live_subscription: Option<crate::dictation::live_text::Subscription>,
     events: Receiver<WorkerEvent>,
     event_sender: mpsc::Sender<WorkerEvent>,
     state: Arc<Mutex<WorkerState>>,
@@ -268,6 +276,7 @@ impl DictationWorker {
             jobs: BTreeMap::new(),
             pending_pastes: 0,
         }));
+        let (live_inbox, live_subscription) = live_output::Inbox::subscribe(output_jobs.clone());
 
         let engine = match TranscriptionEngine::start(WarmTranscriber::default()) {
             Ok(engine) => {
@@ -297,7 +306,16 @@ impl DictationWorker {
         let output_worker = thread::spawn({
             let state = state.clone();
             let events = event_sender.clone();
-            move || run_output_worker(output_receiver, activity, history, &state, &events)
+            move || {
+                run_output_worker(
+                    output_receiver,
+                    live_inbox,
+                    activity,
+                    history,
+                    &state,
+                    &events,
+                )
+            }
         });
 
         let processor_receiver = Arc::new(Mutex::new(processor_receiver));
@@ -323,6 +341,7 @@ impl DictationWorker {
             engine,
             inference_jobs: Some(inference_jobs),
             output_jobs: Some(output_jobs),
+            live_subscription: Some(live_subscription),
             events,
             event_sender,
             state,
@@ -367,6 +386,10 @@ impl DictationWorker {
         context: ContextSnapshot,
         print: Option<crate::control::PrintReply>,
     ) -> Result<DictationJobId, &'static str> {
+        let live_ticket = clip.take_live_ticket();
+        let capture_id = live_ticket
+            .as_ref()
+            .map(crate::dictation::live_text::Ticket::id);
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let job_id = DictationJobId(state.next_output_sequence()?);
         let (Some(engine), Some(jobs)) = (&self.engine, &self.inference_jobs) else {
@@ -404,6 +427,7 @@ impl DictationWorker {
             .map_err(|_| "dictation worker is unavailable")?;
         jobs.try_send(InferenceJob {
             job_id,
+            capture_id,
             control: control.clone(),
             submitted_at,
             transcript,
@@ -415,6 +439,9 @@ impl DictationWorker {
         .map(|()| {
             state.next_sequence += 1;
             state.jobs.insert(job_id, control);
+            if let Some(ticket) = live_ticket {
+                ticket.accept();
+            }
             job_id
         })
         .map_err(queue_error)
@@ -492,6 +519,8 @@ impl DictationWorker {
     }
 
     fn shutdown(&mut self) {
+        // Its watcher owns another sender; remove it before closing the queue.
+        self.live_subscription.take();
         // Accepted jobs still finish: the inference worker drains its queue.
         self.inference_jobs.take();
         join_worker(self.inference_worker.take(), "dictation inference");
@@ -511,6 +540,7 @@ impl Drop for DictationWorker {
 
 fn run_output_worker(
     jobs: Receiver<OutputJob>,
+    live_inbox: Arc<live_output::Inbox>,
     activity: InputActivity,
     history: Option<History>,
     state: &Mutex<WorkerState>,
@@ -520,14 +550,24 @@ fn run_output_worker(
     let mut last_transcript = None;
     let mut ordered = OrderedOutputs::default();
     while let Ok(job) = jobs.recv() {
+        live_inbox.pump(&mut paster, state);
+        rollback_unpasted(&job, &mut paster);
         if matches!(job, OutputJob::PreparePaste) {
             paster.prepare();
             continue;
         }
+        if matches!(job, OutputJob::WakeLive) {
+            continue;
+        }
         for job in ordered.push(job) {
+            rollback_unpasted(&job, &mut paster);
+            let capture = match &job {
+                OutputJob::Completed { capture_id, .. } => *capture_id,
+                _ => None,
+            };
             let event = finish_output(
                 job,
-                &mut |text, mode, commit| paster.paste(text, mode, commit),
+                &mut |text, mode, commit| paster.finish_capture(capture, text, mode, commit),
                 &mut last_transcript,
                 history.as_ref(),
             );
@@ -543,9 +583,39 @@ fn run_output_worker(
             }
             drop(state);
             if events.send(event).is_err() {
+                paster.cancel_all_live();
                 return;
             }
         }
+    }
+    paster.cancel_all_live();
+}
+
+fn rollback_unpasted(job: &OutputJob, paster: &mut Paster) {
+    let capture = match job {
+        OutputJob::Completed {
+            capture_id,
+            control,
+            target,
+            result,
+            ..
+        } if control.is_cancelled()
+            || !matches!(
+                target,
+                TranscriptionTarget::Paste | TranscriptionTarget::RawPaste
+            )
+            || result
+                .as_ref()
+                .as_ref()
+                .map_or(true, |completed| completed.text.trim().is_empty()) =>
+        {
+            *capture_id
+        }
+        OutputJob::Cancelled { capture_id, .. } => *capture_id,
+        _ => None,
+    };
+    if let Some(capture) = capture {
+        paster.live_end(capture, false);
     }
 }
 
@@ -562,7 +632,10 @@ fn run_processor_worker(
             .recv();
         let Ok(job) = job else { break };
         if job.control.is_cancelled() {
-            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
+            let _ = output.send(OutputJob::Cancelled {
+                job_id: job.job_id,
+                capture_id: job.capture_id,
+            });
             continue;
         }
         let mut processed =
@@ -574,7 +647,10 @@ fn run_processor_worker(
             });
         processed.apply_transformations(transformations, &job.context, &job.control.cancelled);
         if job.control.is_cancelled() {
-            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
+            let _ = output.send(OutputJob::Cancelled {
+                job_id: job.job_id,
+                capture_id: job.capture_id,
+            });
             continue;
         }
         if let Some(observation) = &processed.observation
@@ -589,6 +665,7 @@ fn run_processor_worker(
         if output
             .send(OutputJob::Completed {
                 job_id: job.job_id,
+                capture_id: job.capture_id,
                 control: job.control,
                 target: job.target,
                 result: Box::new(Ok(CompletedTranscript {
@@ -733,7 +810,10 @@ fn run_inference_worker(
 ) {
     while let Ok(job) = jobs.recv() {
         if job.control.is_cancelled() {
-            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
+            let _ = output.send(OutputJob::Cancelled {
+                job_id: job.job_id,
+                capture_id: job.capture_id,
+            });
             continue;
         }
         let _busy = DictationInference::begin();
@@ -773,7 +853,10 @@ fn run_inference_worker(
             inference_ms: inference_started.elapsed().as_millis(),
         };
         if job.control.is_cancelled() {
-            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
+            let _ = output.send(OutputJob::Cancelled {
+                job_id: job.job_id,
+                capture_id: job.capture_id,
+            });
             continue;
         }
         let target = job.target;
@@ -787,6 +870,7 @@ fn run_inference_worker(
                 if processor_jobs
                     .send(ProcessorJob {
                         job_id: job.job_id,
+                        capture_id: job.capture_id,
                         control: job.control,
                         target,
                         text,
@@ -810,6 +894,7 @@ fn run_inference_worker(
                 if output
                     .send(OutputJob::Completed {
                         job_id: job.job_id,
+                        capture_id: job.capture_id,
                         control: job.control,
                         target,
                         result: Box::new(result),
@@ -936,9 +1021,12 @@ fn finish_output(
     history: Option<&History>,
 ) -> WorkerEvent {
     match job {
-        OutputJob::PreparePaste => unreachable!("paste preparation bypasses ordered output"),
+        OutputJob::PreparePaste | OutputJob::WakeLive => {
+            unreachable!("live updates and preparation bypass ordered output")
+        }
         OutputJob::Completed {
             job_id,
+            capture_id,
             control,
             target,
             result,
@@ -955,7 +1043,7 @@ fn finish_output(
                 let paste_started = Instant::now();
                 if !completed.text.trim().is_empty() {
                     let commit = || control.begin_output();
-                    match target {
+                    let output = match target {
                         TranscriptionTarget::Paste | TranscriptionTarget::RawPaste => {
                             // Labs › Copy dictation only, read as the output
                             // commits: dictations go to the clipboard
@@ -972,17 +1060,21 @@ fn finish_output(
                         | TranscriptionTarget::RawPrint => commit()
                             .then_some(())
                             .ok_or_else(|| eyre!("dictation was cancelled")),
+                    };
+                    // Live output may stop when the person edits or changes
+                    // fields. Keep the final result available for recovery.
+                    if output.is_ok() || (capture_id.is_some() && !control.is_cancelled()) {
+                        if matches!(
+                            target,
+                            TranscriptionTarget::Paste | TranscriptionTarget::RawPaste
+                        ) {
+                            *last_transcript = Some(completed.text.clone());
+                        }
+                        if let Some(history) = history {
+                            record_history(history, target, &completed);
+                        }
                     }
-                    .map_err(|error| error.to_string())?;
-                    if matches!(
-                        target,
-                        TranscriptionTarget::Paste | TranscriptionTarget::RawPaste
-                    ) {
-                        *last_transcript = Some(completed.text.clone());
-                    }
-                    if let Some(history) = history {
-                        record_history(history, target, &completed);
-                    }
+                    output.map_err(|error| error.to_string())?;
                 }
                 tracing::info!(
                     audio_ms = completed.timings.audio_ms,
@@ -1019,7 +1111,7 @@ fn finish_output(
                 }
             }
         }
-        OutputJob::Completed { job_id, .. } | OutputJob::Cancelled { job_id } => {
+        OutputJob::Completed { job_id, .. } | OutputJob::Cancelled { job_id, .. } => {
             WorkerEvent::Cancelled { job_id }
         }
         OutputJob::Paste { kind, .. } => {
@@ -1287,6 +1379,7 @@ mod tests {
     fn processing_job(target: TranscriptionTarget) -> ProcessorJob {
         ProcessorJob {
             job_id: DictationJobId(0),
+            capture_id: None,
             control: Arc::new(JobControl::default()),
             target,
             text: "raw instruction".into(),
@@ -1433,6 +1526,7 @@ mod tests {
             engine: None,
             inference_jobs: None,
             output_jobs: Some(output_sender),
+            live_subscription: None,
             events,
             event_sender,
             state: Arc::new(Mutex::new(WorkerState {
@@ -1470,6 +1564,7 @@ mod tests {
         let mut outputs = OrderedOutputs::default();
         let completed = |sequence| OutputJob::Completed {
             job_id: DictationJobId(sequence),
+            capture_id: None,
             control: Arc::new(JobControl::default()),
             target: TranscriptionTarget::Paste,
             result: Box::new(Err("late result".into())),
@@ -1480,6 +1575,7 @@ mod tests {
             outputs
                 .push(OutputJob::Cancelled {
                     job_id: DictationJobId(1),
+                    capture_id: None,
                 })
                 .is_empty()
         );

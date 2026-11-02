@@ -70,6 +70,26 @@ fn set_live_text(spot: Spot) {
     *LIVE_TEXT.lock().unwrap_or_else(|error| error.into_inner()) = Some(spot);
 }
 
+/// The HUD plate's middle as of its last show, in Rune's global space.
+#[cfg(target_os = "macos")]
+static PLATE_CENTER: Mutex<Option<[f32; 2]>> = Mutex::new(None);
+
+/// Where Labs › Words to cursor's words leave from: the HUD plate's middle
+/// as of its last show, or where it would sit with the HUD hidden.
+#[cfg(target_os = "macos")]
+pub(crate) fn plate_center() -> Option<[f32; 2]> {
+    *PLATE_CENTER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+#[cfg(target_os = "macos")]
+fn set_plate_center(center: [f32; 2]) {
+    *PLATE_CENTER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(center);
+}
+
 /// How a listener reports to the HUD; sending never waits.
 #[derive(Clone)]
 pub(crate) struct HudSender {
@@ -102,6 +122,8 @@ const FIRST_FRAME: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl HudSender {
     pub(crate) fn send(&self, event: HudEvent) {
+        #[cfg(target_os = "macos")]
+        crate::words_to_caret::observe(event);
         #[cfg(target_os = "windows")]
         if matches!(event, HudEvent::Started) {
             let presents = self.overlay.surface_stats().totals.presents;

@@ -1423,6 +1423,8 @@ pub struct LabsSettings {
     pub stop_when_call_ends: bool,
     /// Output's Try card offers Vocabulary and Fix this beside its result (issue 989).
     pub output_fixes: bool,
+    /// The homepage character speaks words toward the text cursor (macOS).
+    pub words_to_caret: bool,
 }
 
 /// The idle times Labs › Unload model when idle offers, in minutes.
@@ -1458,6 +1460,7 @@ impl Default for LabsSettings {
             skip_pauses: false,
             stop_when_call_ends: false,
             output_fixes: false,
+            words_to_caret: false,
         }
     }
 }

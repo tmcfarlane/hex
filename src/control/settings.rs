@@ -393,6 +393,11 @@ const KEYS: &[Key] = &[
         "Labs: Output's Try card offers Vocabulary and Fix this, which copies an agent prompt naming the wrong result",
     ),
     key(
+        "labs.words_to_caret",
+        Kind::Bool,
+        "Labs: the homepage character speaks your words toward the text cursor (macOS)",
+    ),
+    key(
         "meetings.enabled",
         Kind::Bool,
         "Labs: Meetings (beta), call detection, recording, and transcripts",

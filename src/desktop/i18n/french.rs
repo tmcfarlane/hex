@@ -15,6 +15,8 @@ pub(super) fn table() -> &'static HashMap<&'static str, &'static str> {
 
 #[rustfmt::skip]
 const TRANSLATIONS: &[(&str, &str)] = &[
+    ("Hex buddy", "Compagnon Hex"),
+    ("The homepage character speaks your words toward the text cursor", "Le personnage de la page d'accueil fait voler vos paroles vers le curseur de texte"),
     ("Fix results in Output", "Corriger les résultats dans Sortie"),
     ("Offer Vocabulary and Fix this beside Output's Try result, to correct a wrong result", "Propose Vocabulaire et Corriger ceci à côté du résultat d'essai de Sortie, pour corriger un résultat erroné"),
     ("Fix this", "Corriger ceci"),

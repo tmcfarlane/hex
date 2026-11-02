@@ -130,6 +130,9 @@ pub struct DictationClip {
     source: Option<Box<ClipSource>>,
     /// The live stream fed with this clip's audio during capture, if any.
     stream: Option<LiveStream>,
+    /// The live-text publisher for this recording, if it published partials.
+    #[cfg(target_os = "macos")]
+    live_capture_id: Option<live_text::Ticket>,
     /// Keeps background work deferring until the clip is submitted.
     #[cfg(target_os = "macos")]
     capture: Option<crate::audio::recording_environment::CaptureMarker>,
@@ -143,6 +146,11 @@ impl DictationClip {
     /// Takes the clip's live stream; finish it with the complete clip.
     pub fn take_stream(&mut self) -> Option<LiveStream> {
         self.stream.take()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn take_live_ticket(&mut self) -> Option<live_text::Ticket> {
+        self.live_capture_id.take()
     }
 
     /// Takes the marker that defers background work; hold it until the clip
@@ -172,6 +180,8 @@ impl DictationClip {
             timeline: ClipTimeline::default(),
             source: None,
             stream: None,
+            #[cfg(target_os = "macos")]
+            live_capture_id: None,
             #[cfg(target_os = "macos")]
             capture: None,
         }
@@ -424,6 +434,7 @@ struct Recording {
     /// This recording's hold on the HUDs' live text, from its first text;
     /// dropping the recording clears it.
     live_text: Option<crate::dictation::live_text::Publisher>,
+    live_insertion_allowed: bool,
     #[cfg(target_os = "macos")]
     environment: RecordingEnvironmentState,
     #[cfg(target_os = "macos")]
@@ -493,6 +504,7 @@ impl Recording {
             resampler,
             stream: None,
             live_text: None,
+            live_insertion_allowed: false,
             #[cfg(target_os = "macos")]
             environment: RecordingEnvironmentState::Disabled,
             #[cfg(target_os = "macos")]
@@ -635,6 +647,13 @@ impl DictationCapture {
 
     pub fn is_recording(&self) -> bool {
         self.recording.is_some()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn allow_live_insertion(&mut self, allowed: bool) {
+        if let Some(recording) = &mut self.recording {
+            recording.live_insertion_allowed = allowed;
+        }
     }
 
     #[cfg(any(test, target_os = "linux"))]
@@ -874,7 +893,11 @@ impl DictationCapture {
         );
         recording
             .live_text
-            .get_or_insert_with(crate::dictation::live_text::Publisher::new)
+            .get_or_insert_with(|| {
+                crate::dictation::live_text::Publisher::for_capture(
+                    recording.live_insertion_allowed,
+                )
+            })
             .show(&partial);
     }
 
@@ -918,6 +941,14 @@ impl DictationCapture {
         };
 
         let stream = recording.stream.take();
+        if let Some(publisher) = &mut recording.live_text {
+            publisher.mark_submitted();
+        }
+        #[cfg(target_os = "macos")]
+        let live_capture_id = recording
+            .live_text
+            .as_ref()
+            .map(|publisher| live_text::Ticket::new(publisher.id()));
         let kept_tail = recording
             .recorded_through
             .and_then(|through| through.checked_duration_since(ended_at))
@@ -941,6 +972,8 @@ impl DictationCapture {
             source: None,
             samples,
             stream,
+            #[cfg(target_os = "macos")]
+            live_capture_id,
             #[cfg(target_os = "macos")]
             capture,
         })

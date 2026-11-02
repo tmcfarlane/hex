@@ -15,6 +15,15 @@ use super::{Pane, Ui};
 use crate::desktop::i18n::{tr, tr_fill};
 use crate::labs::Feature;
 
+pub(super) fn fixture_link(ui: &mut Ui, feature: Feature) {
+    *ui = super::mac_fixture();
+    ui.labs_open = true;
+    ui.lab_flash = Some((
+        feature,
+        std::time::Instant::now() + std::time::Duration::from_secs(3600),
+    ));
+}
+
 pub(super) static LABS_ICON: Icon = Icon {
     name: "hex-labs",
     view: 16.0,
@@ -212,6 +221,14 @@ fn rows(ui: &Ui) -> Vec<Row> {
         tr("Live text"),
         tr("Show provisional words beside the HUD while dictating"),
     ));
+    if caps.os == super::platform::Os::Macos {
+        rows.push(row(
+            Feature::WordsToCaret,
+            &HINTS,
+            tr("Hex buddy"),
+            tr("The homepage character speaks your words toward the text cursor"),
+        ));
+    }
     if caps.meetings {
         rows.push(row(
             Feature::LiveChapters,
@@ -455,6 +472,7 @@ fn row_key(feature: Feature) -> &'static str {
         Feature::SkipPauses => "lab-skip-pauses",
         Feature::StopWhenCallEnds => "lab-stop-when-call-ends",
         Feature::OutputFixes => "lab-output-fixes",
+        Feature::WordsToCaret => "lab-words-to-caret",
     }
 }
 

@@ -1,6 +1,6 @@
 //! Scripted native rehearsal: no microphone, Accessibility, or observers.
 
-use rune::{AppSpec, TextEdit};
+use rune::{AppSpec, TextEdit, col};
 use rune_kit::TextInput;
 
 use super::*;
@@ -126,7 +126,8 @@ fn poll(s: &mut Flights, time: f64, tx: &mut Tx) -> bool {
 }
 
 pub(super) fn field(s: &Flights, p: Paint) -> El {
-    el().key("destination")
+    col()
+        .key("destination")
         .absolute(288.0, 209.0)
         .w(430.0)
         .child(text("Draft").font(p.k.ty.small).color(p.muted()).mb(10.0))

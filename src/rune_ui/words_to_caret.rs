@@ -558,20 +558,24 @@ fn view(s: &Flights, cx: &mut Cx<Flights>) -> El {
     }
     if !s.preview.trim().is_empty() {
         root = root.child(
-            text(s.preview.clone())
-                .key("preview")
+            el().key("preview")
                 .absolute(
                     s.buddy[0] - s.origin[0] - 95.0,
                     s.buddy[1] - s.origin[1] + 112.0,
                 )
                 .w(300.0)
-                .truncate_head()
-                .font(p.k.ty.ui)
-                .color(p.text())
-                .px(10.0)
-                .py(5.0)
-                .radius(p.k.radius.md)
-                .fill(p.k.c.bg_base),
+                .center()
+                .child(
+                    text(s.preview.clone())
+                        .max_w(300.0)
+                        .truncate_head()
+                        .font(p.k.ty.ui)
+                        .color(p.text())
+                        .px(10.0)
+                        .py(5.0)
+                        .radius(p.k.radius.md)
+                        .fill(p.k.c.bg_base),
+                ),
         );
     }
     if !cx.system_reduced_motion() {
